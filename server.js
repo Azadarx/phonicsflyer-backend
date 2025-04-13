@@ -66,7 +66,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// API to verify payment
+// API to verify payment (POST method)
 app.post('/api/verify-payment', async (req, res) => {
     try {
         const {
@@ -167,8 +167,8 @@ app.post('/api/verify-payment', async (req, res) => {
     }
 });
 
-// API endpoint to check if payment is authentic
-app.get('/api/verify-payment', (req, res) => {
+// API endpoint to check if payment is authentic (GET method - renamed to avoid conflict)
+app.get('/api/check-payment', (req, res) => {
     const paymentId = req.query.payment_id;
 
     if (successfulPayments.has(paymentId)) {
@@ -178,16 +178,35 @@ app.get('/api/verify-payment', (req, res) => {
     }
 });
 
-// Important: Serve static files and catch-all route only in production
+// For production environment
 if (process.env.NODE_ENV === 'production') {
+    // First, handle specific file paths to avoid wildcard routes
+    app.get('/index.html', (req, res) => {
+        res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    });
+    
+    app.get('/favicon.ico', (req, res) => {
+        res.sendFile(path.join(__dirname, 'build', 'favicon.ico'));
+    });
+    
     // Serve static files
     app.use(express.static(path.join(__dirname, 'build')));
     
-    // Catch-all route - this should be AFTER all API routes
-    // Fixed version - specify string format for the path pattern
-    app.get('/*', (req, res) => {
+    // Define explicit routes for common paths rather than using wildcards
+    app.get('/', (req, res) => {
         res.sendFile(path.join(__dirname, 'build', 'index.html'));
     });
+    
+    // Handle other common frontend routes explicitly
+    app.get('/success', (req, res) => {
+        res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    });
+    
+    app.get('/register', (req, res) => {
+        res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    });
+    
+    // Add any other specific routes your app needs
 }
 
 app.listen(PORT, () => {
