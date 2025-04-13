@@ -7,6 +7,7 @@ const path = require('path');
 const Razorpay = require('razorpay');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -66,7 +67,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// API to verify payment (POST method)
+// API to verify payment
 app.post('/api/verify-payment', async (req, res) => {
     try {
         const {
@@ -167,7 +168,7 @@ app.post('/api/verify-payment', async (req, res) => {
     }
 });
 
-// API endpoint to check if payment is authentic (GET method - renamed to avoid conflict)
+// API endpoint to check if payment is authentic
 app.get('/api/check-payment', (req, res) => {
     const paymentId = req.query.payment_id;
 
@@ -178,36 +179,20 @@ app.get('/api/check-payment', (req, res) => {
     }
 });
 
-// For production environment
-if (process.env.NODE_ENV === 'production') {
-    // First, handle specific file paths to avoid wildcard routes
-    app.get('/index.html', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'index.html'));
-    });
-    
-    app.get('/favicon.ico', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'favicon.ico'));
-    });
-    
-    // Serve static files
-    app.use(express.static(path.join(__dirname, 'build')));
-    
-    // Define explicit routes for common paths rather than using wildcards
-    app.get('/', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'index.html'));
-    });
-    
-    // Handle other common frontend routes explicitly
-    app.get('/success', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'index.html'));
-    });
-    
-    app.get('/register', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'index.html'));
-    });
-    
-    // Add any other specific routes your app needs
-}
+// Add a default route for the API
+app.get('/api', (req, res) => {
+    res.json({ message: 'API is running' });
+});
+
+// Add a simple status check route
+app.get('/status', (req, res) => {
+    res.json({ status: 'Server is running' });
+});
+
+// Default route to show server is working
+app.get('/', (req, res) => {
+    res.send('Server is running. API available at /api endpoints.');
+});
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
