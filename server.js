@@ -14,14 +14,6 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
-if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.join(__dirname, 'build')));
-
-    app.get('*', (req, res) => {
-        res.sendFile(path.join(__dirname, 'build', 'index.html'));
-    });
-}
-
 
 // Initialize Razorpay
 const razorpay = new Razorpay({
@@ -61,7 +53,6 @@ app.post('/api/register', async (req, res) => {
         const order = await razorpay.orders.create(options);
 
         // Store user data temporarily (in production use a database)
-        // This is just for demo purposes
         app.locals[order.id] = { fullName, email, phone };
 
         res.json({
@@ -108,30 +99,30 @@ app.post('/api/verify-payment', async (req, res) => {
                 to: userData.email,
                 subject: 'Your Registration is Confirmed! - Inspiring Shereen Masterclass',
                 html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
-            <h2 style="color: #7C3AED; text-align: center;">Thank You for Registering!</h2>
-            <p>Dear ${userData.fullName},</p>
-            <p>Your payment has been successfully processed and your spot in our <strong>Life-Changing 3-Hour Masterclass</strong> is confirmed! 🎉</p>
-            
-            <div style="background-color: #F5F3FF; padding: 15px; border-radius: 10px; margin: 20px 0;">
-              <h3 style="color: #7C3AED; margin-top: 0;">Event Details:</h3>
-              <p>📅 <strong>Date:</strong> April 19th</p>
-              <p>🕦 <strong>Time:</strong> 11:30 AM</p>
-              <p>📍 <strong>Location:</strong> Live on Zoom (Interactive + Reflective Exercises)</p>
-              <p>We'll send you the Zoom link and any additional instructions 24 hours before the event.</p>
-            </div>
-            
-            <p>Get ready to break free from stress, confusion & setbacks and take control of your life with clarity and confidence! ✨</p>
-            
-            <p>If you have any questions before the masterclass, feel free to reply to this email.</p>
-            
-            <p>Looking forward to helping you transform your life!</p>
-            
-            <p style="margin-bottom: 0;">Warm regards,</p>
-            <p style="margin-top: 5px;"><strong>Inspiring Shereen</strong></p>
-            <p style="color: #7C3AED;">Life Coach | Shaping Lives With Holistic Success</p>
-          </div>
-        `
+                  <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+                    <h2 style="color: #7C3AED; text-align: center;">Thank You for Registering!</h2>
+                    <p>Dear ${userData.fullName},</p>
+                    <p>Your payment has been successfully processed and your spot in our <strong>Life-Changing 3-Hour Masterclass</strong> is confirmed! 🎉</p>
+                    
+                    <div style="background-color: #F5F3FF; padding: 15px; border-radius: 10px; margin: 20px 0;">
+                      <h3 style="color: #7C3AED; margin-top: 0;">Event Details:</h3>
+                      <p>📅 <strong>Date:</strong> April 19th</p>
+                      <p>🕦 <strong>Time:</strong> 11:30 AM</p>
+                      <p>📍 <strong>Location:</strong> Live on Zoom (Interactive + Reflective Exercises)</p>
+                      <p>We'll send you the Zoom link and any additional instructions 24 hours before the event.</p>
+                    </div>
+                    
+                    <p>Get ready to break free from stress, confusion & setbacks and take control of your life with clarity and confidence! ✨</p>
+                    
+                    <p>If you have any questions before the masterclass, feel free to reply to this email.</p>
+                    
+                    <p>Looking forward to helping you transform your life!</p>
+                    
+                    <p style="margin-bottom: 0;">Warm regards,</p>
+                    <p style="margin-top: 5px;"><strong>Inspiring Shereen</strong></p>
+                    <p style="color: #7C3AED;">Life Coach | Shaping Lives With Holistic Success</p>
+                  </div>
+                `
             };
 
             // Send email to admin
@@ -140,20 +131,20 @@ app.post('/api/verify-payment', async (req, res) => {
                 to: process.env.EMAIL_USER,
                 subject: 'New Registration - Inspiring Shereen Masterclass',
                 html: `
-          <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-            <h2 style="color: #7C3AED;">New Registration!</h2>
-            <p>A new participant has registered for the Life Coaching Masterclass:</p>
-            
-            <ul>
-              <li><strong>Full Name:</strong> ${userData.fullName}</li>
-              <li><strong>Email:</strong> ${userData.email}</li>
-              <li><strong>Phone:</strong> ${userData.phone}</li>
-              <li><strong>Payment ID:</strong> ${razorpay_payment_id}</li>
-              <li><strong>Order ID:</strong> ${razorpay_order_id}</li>
-              <li><strong>Amount Paid:</strong> ₹99</li>
-            </ul>
-          </div>
-        `
+                  <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+                    <h2 style="color: #7C3AED;">New Registration!</h2>
+                    <p>A new participant has registered for the Life Coaching Masterclass:</p>
+                    
+                    <ul>
+                      <li><strong>Full Name:</strong> ${userData.fullName}</li>
+                      <li><strong>Email:</strong> ${userData.email}</li>
+                      <li><strong>Phone:</strong> ${userData.phone}</li>
+                      <li><strong>Payment ID:</strong> ${razorpay_payment_id}</li>
+                      <li><strong>Order ID:</strong> ${razorpay_order_id}</li>
+                      <li><strong>Amount Paid:</strong> ₹99</li>
+                    </ul>
+                  </div>
+                `
             };
 
             try {
@@ -187,10 +178,16 @@ app.get('/api/verify-payment', (req, res) => {
     }
 });
 
-// Serve React app for all other routes
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'build', 'index.html'));
-});
+// Important: Serve static files and catch-all route only in production
+if (process.env.NODE_ENV === 'production') {
+    // Serve static files
+    app.use(express.static(path.join(__dirname, 'build')));
+    
+    // Catch-all route - this should be AFTER all API routes
+    app.get('*', (req, res) => {
+        res.sendFile(path.join(__dirname, 'build', 'index.html'));
+    });
+}
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
