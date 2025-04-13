@@ -45,7 +45,7 @@ app.post('/api/register', async (req, res) => {
 
         // Create Razorpay order
         const options = {
-            amount: 9900,// 99 rupees in paise
+            amount: 9900, // 99 rupees in paise
             currency: 'INR',
             receipt: `receipt_${Date.now()}`
         };
@@ -184,7 +184,8 @@ if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.join(__dirname, 'build')));
     
     // Catch-all route - this should be AFTER all API routes
-    app.get('*', (req, res) => {
+    // Fixed version - specify string format for the path pattern
+    app.get('/*', (req, res) => {
         res.sendFile(path.join(__dirname, 'build', 'index.html'));
     });
 }
