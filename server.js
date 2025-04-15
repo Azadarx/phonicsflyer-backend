@@ -42,20 +42,9 @@ const registrations = new Map();
 // Store confirmed payments
 const confirmedPayments = new Set();
 
-// Cashfree configuration
-const CASHFREE_BASE_URL = process.env.CASHFREE_ENVIRONMENT === 'PRODUCTION'
-    ? 'https://api.cashfree.com/pg'
-    : 'https://sandbox.cashfree.com/pg';
-
-// Helper function to generate Cashfree headers
-const getCashfreeHeaders = () => {
-    return {
-        'x-api-version': process.env.CASHFREE_API_VERSION || '2022-09-01',
-        'x-client-id': process.env.VITE_CASHFREE_APP_ID, // Make sure this matches your .env variable
-        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
-        'Content-Type': 'application/json'
-    };
-};
+// Razorpay configuration
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
 
 // Function to send confirmation emails
 async function sendConfirmationEmails(userData, referenceId, transactionId) {
@@ -121,6 +110,16 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
     }
 }
 
+// Function to verify Razorpay signature
+function verifyRazorpaySignature(orderId, paymentId, signature) {
+    const generatedSignature = crypto
+        .createHmac('sha256', RAZORPAY_KEY_SECRET)
+        .update(orderId + '|' + paymentId)
+        .digest('hex');
+    
+    return generatedSignature === signature;
+}
+
 // API Routes
 app.post('/api/register', async (req, res) => {
     try {
@@ -143,13 +142,7 @@ app.post('/api/register', async (req, res) => {
 
         res.json({
             success: true,
-            referenceId: referenceId,
-            paymentDetails: {
-                upiId: "9494100110@yesbank",
-                name: "Inspiring Shereen",
-                amount: "99",
-                currency: "INR"
-            }
+            referenceId: referenceId
         });
     } catch (error) {
         console.error('Registration error:', error);
@@ -170,67 +163,52 @@ app.post('/api/create-payment-order', async (req, res) => {
         }
 
         const userData = registrations.get(referenceId);
-        const orderId = `ORDER_${referenceId}_${Date.now()}`;
-
-        // Add additional URL to accommodate the frontend domain
-        const frontendUrl = process.env.FRONTEND_URL || 'https://inspiringshereen.vercel.app';
-
+        
+        // Get Razorpay instance (using axios to create order)
         const orderData = {
-            order_id: orderId,
-            order_amount: 99,
-            order_currency: "INR",
-            customer_details: {
-                customer_id: referenceId,
-                customer_name: userData.fullName,
-                customer_email: userData.email,
-                customer_phone: userData.phone
-            },
-            order_meta: {
-                return_url: `${frontendUrl}/success?reference_id=${referenceId}&order_id=${orderId}`,
-                notify_url: `${process.env.VITE_API_BASE_URL}/api/cashfree-webhook`
+            amount: 9900, // amount in paisa (99 INR)
+            currency: "INR",
+            receipt: `receipt_${referenceId}`,
+            notes: {
+                referenceId: referenceId,
+                customerName: userData.fullName,
+                customerEmail: userData.email,
+                customerPhone: userData.phone
             }
         };
 
-        const appId = process.env.VITE_CASHFREE_APP_ID;
-        const secretKey = process.env.CASHFREE_SECRET_KEY;
-
-        if (!appId || !secretKey) {
-            console.error('Cashfree credentials not configured', { appId: !!appId, secretKey: !!secretKey });
-            return res.status(500).json({ error: 'Payment gateway configuration error' });
-        }
-
         try {
-            console.log('Sending request to Cashfree with headers:',
-                JSON.stringify({
-                    'x-api-version': process.env.CASHFREE_API_VERSION,
-                    'x-client-id': '***', // Masked for logging
-                    'Content-Type': 'application/json'
-                }));
-
+            // Create Razorpay order using Razorpay API
             const response = await axios.post(
-                `${CASHFREE_BASE_URL}/orders`,
+                'https://api.razorpay.com/v1/orders',
                 orderData,
-                { headers: getCashfreeHeaders() }
+                {
+                    auth: {
+                        username: RAZORPAY_KEY_ID,
+                        password: RAZORPAY_KEY_SECRET
+                    },
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                }
             );
 
-            console.log('Cashfree response:', JSON.stringify(response.data));
-
+            const { id: orderId } = response.data;
+            
+            // Store order ID in user data
             userData.orderId = orderId;
             registrations.set(referenceId, userData);
 
             res.json({
                 success: true,
                 orderId: orderId,
-                paymentSessionId: response.data.payment_session_id,
-                orderToken: response.data.order_token,
-                appId: appId
+                razorpayKey: RAZORPAY_KEY_ID
             });
         } catch (apiError) {
-            console.error('Cashfree API error:', apiError.response?.data || apiError.message);
-            console.error('Error details:', apiError);
+            console.error('Razorpay API error:', apiError.response?.data || apiError.message);
             res.status(500).json({
                 error: 'Failed to create payment order',
-                details: apiError.response?.data?.message || apiError.message
+                details: apiError.response?.data?.error?.description || apiError.message
             });
         }
     } catch (error) {
@@ -278,91 +256,118 @@ app.get('/api/check-payment', (req, res) => {
 
 app.post('/api/confirm-payment', async (req, res) => {
     try {
-        const { referenceId, transactionId } = req.body;
+        const { 
+            razorpay_payment_id, 
+            razorpay_order_id, 
+            razorpay_signature, 
+            referenceId 
+        } = req.body;
 
-        if (!referenceId || !transactionId) {
-            return res.status(400).json({ error: 'Reference ID and Transaction ID are required' });
+        if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !referenceId) {
+            return res.status(400).json({ 
+                error: 'Payment details are incomplete' 
+            });
+        }
+
+        // Verify the signature
+        const isSignatureValid = verifyRazorpaySignature(
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature
+        );
+
+        if (!isSignatureValid) {
+            return res.status(400).json({ 
+                error: 'Invalid payment signature' 
+            });
         }
 
         if (!registrations.has(referenceId)) {
-            return res.status(404).json({ error: 'Invalid reference ID' });
+            return res.status(404).json({ 
+                error: 'Invalid reference ID' 
+            });
         }
 
         const userData = registrations.get(referenceId);
         userData.paymentConfirmed = true;
-        userData.transactionId = transactionId;
+        userData.transactionId = razorpay_payment_id;
         registrations.set(referenceId, userData);
         confirmedPayments.add(referenceId);
 
-        await sendConfirmationEmails(userData, referenceId, transactionId);
-        res.json({ success: true, referenceId });
+        // Send confirmation emails
+        await sendConfirmationEmails(userData, referenceId, razorpay_payment_id);
+        
+        res.json({ 
+            success: true, 
+            referenceId 
+        });
     } catch (error) {
         console.error('Payment confirmation error:', error);
-        res.status(500).json({ error: 'Something went wrong' });
+        res.status(500).json({ 
+            error: 'Something went wrong during payment confirmation' 
+        });
     }
 });
 
-app.post('/api/cashfree-webhook', async (req, res) => {
+app.post('/api/razorpay-webhook', async (req, res) => {
     try {
         const webhookData = req.body;
-        console.log('Received Cashfree webhook:', JSON.stringify(webhookData));
+        console.log('Received Razorpay webhook:', JSON.stringify(webhookData));
 
-        const signature = req.headers['x-webhook-signature'] || '';
-        const requestBody = JSON.stringify(req.body);
-
-        // Verify signature if it exists
-        if (signature) {
-            const computedSignature = crypto
-                .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
-                .update(requestBody)
-                .digest('hex');
-
-            if (signature !== computedSignature) {
-                console.error('Invalid webhook signature');
-                return res.status(401).json({ success: false, error: 'Invalid signature' });
-            }
-        }
-
-        if (webhookData.data && webhookData.data.order) {
-            const orderId = webhookData.data.order.order_id;
-            const orderStatus = webhookData.data.order.order_status;
-
-            console.log(`Processing webhook for order ${orderId} with status ${orderStatus}`);
-
-            if (orderStatus === 'PAID') {
-                let referenceId = null;
-                for (const [key, value] of registrations.entries()) {
-                    if (value.orderId === orderId) {
-                        referenceId = key;
-                        break;
-                    }
-                }
-
-                if (referenceId) {
-                    const userData = registrations.get(referenceId);
-                    userData.paymentConfirmed = true;
-                    userData.transactionId = webhookData.data.order.cf_order_id || webhookData.data.order.order_id;
-                    registrations.set(referenceId, userData);
-                    confirmedPayments.add(referenceId);
-
-                    try {
-                        await sendConfirmationEmails(
-                            userData,
-                            referenceId,
-                            webhookData.data.order.cf_order_id || webhookData.data.order.order_id
-                        );
-                        console.log(`Confirmation emails sent for reference ID: ${referenceId}`);
-                    } catch (emailError) {
-                        console.error(`Failed to send confirmation emails for ${referenceId}:`, emailError);
-                    }
-
-                    console.log(`Payment confirmed for reference ID: ${referenceId}`);
-                } else {
-                    console.error(`Could not find referenceId for order ${orderId}`);
+        // Verify webhook signature
+        const webhookSignature = req.headers['x-razorpay-signature'];
+        
+        if (webhookSignature) {
+            const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+            
+            if (webhookSecret) {
+                const generatedSignature = crypto
+                    .createHmac('sha256', webhookSecret)
+                    .update(JSON.stringify(req.body))
+                    .digest('hex');
+                
+                if (generatedSignature !== webhookSignature) {
+                    console.error('Invalid webhook signature');
+                    return res.status(401).json({ success: false, error: 'Invalid signature' });
                 }
             }
         }
 
+        // Process payment success
+        if (webhookData.event === 'payment.captured' || webhookData.event === 'payment.authorized') {
+            const paymentData = webhookData.payload.payment.entity;
+            const orderId = paymentData.order_id;
+            const paymentId = paymentData.id;
+            
+            // Find the reference ID from the order ID
+            let referenceId = null;
+            for (const [key, value] of registrations.entries()) {
+                if (value.orderId === orderId) {
+                    referenceId = key;
+                    break;
+                }
+            }
+            
+            if (referenceId) {
+                const userData = registrations.get(referenceId);
+                userData.paymentConfirmed = true;
+                userData.transactionId = paymentId;
+                registrations.set(referenceId, userData);
+                confirmedPayments.add(referenceId);
+                
+                // Send confirmation emails
+                try {
+                    await sendConfirmationEmails(userData, referenceId, paymentId);
+                    console.log(`Confirmation emails sent for reference ID: ${referenceId}`);
+                } catch (emailError) {
+                    console.error(`Failed to send confirmation emails for ${referenceId}:`, emailError);
+                }
+            } else {
+                console.error(`Could not find referenceId for order ${orderId}`);
+            }
+        }
+        
+        // Always return 200 for webhooks to acknowledge receipt
         res.status(200).json({ success: true });
     } catch (error) {
         console.error('Webhook processing error:', error);
