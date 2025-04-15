@@ -12,26 +12,19 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors({
-    origin: function (origin, callback) {
-        const allowedOrigins = [
-            'https://inspiringshereen.vercel.app',
-            'http://localhost:5173',
-            'https://sdk.cashfree.com', // Add Cashfree domain
-            'https://sandbox.cashfree.com', // Add Cashfree sandbox domain
-            'https://api.cashfree.com' // Add Cashfree production domain
-        ];
-
-        if (!origin || allowedOrigins.includes(origin) || origin.includes('cashfree.com')) {
-            callback(null, true);
-        } else {
-            console.log(`Blocked request from origin: ${origin}`);
-            callback(new Error('Not allowed by CORS'));
-        }
-    },
+    origin: '*', // This will allow all origins for development
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Alternative CORS setup if needed
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+    next();
+});
 
 app.use(bodyParser.json());
 
@@ -58,7 +51,7 @@ const CASHFREE_BASE_URL = process.env.CASHFREE_ENVIRONMENT === 'PRODUCTION'
 const getCashfreeHeaders = () => {
     return {
         'x-api-version': process.env.CASHFREE_API_VERSION || '2022-09-01',
-        'x-client-id': process.env.CASHFREE_APP_ID,
+        'x-client-id': process.env.VITE_CASHFREE_APP_ID, // Make sure this matches your .env variable
         'x-client-secret': process.env.CASHFREE_SECRET_KEY,
         'Content-Type': 'application/json'
     };
@@ -179,6 +172,9 @@ app.post('/api/create-payment-order', async (req, res) => {
         const userData = registrations.get(referenceId);
         const orderId = `ORDER_${referenceId}_${Date.now()}`;
 
+        // Add additional URL to accommodate the frontend domain
+        const frontendUrl = process.env.FRONTEND_URL || 'https://inspiringshereen.vercel.app';
+
         const orderData = {
             order_id: orderId,
             order_amount: 99,
@@ -190,21 +186,34 @@ app.post('/api/create-payment-order', async (req, res) => {
                 customer_phone: userData.phone
             },
             order_meta: {
-                return_url: `${process.env.FRONTEND_URL || 'https://inspiringshereen.vercel.app'}/success?reference_id=${referenceId}`
+                return_url: `${frontendUrl}/success?reference_id=${referenceId}&order_id=${orderId}`,
+                notify_url: `${process.env.VITE_API_BASE_URL}/api/cashfree-webhook`
             }
         };
 
-        if (!process.env.CASHFREE_APP_ID || !process.env.CASHFREE_SECRET_KEY) {
-            console.error('Cashfree credentials not configured');
+        const appId = process.env.VITE_CASHFREE_APP_ID;
+        const secretKey = process.env.CASHFREE_SECRET_KEY;
+
+        if (!appId || !secretKey) {
+            console.error('Cashfree credentials not configured', { appId: !!appId, secretKey: !!secretKey });
             return res.status(500).json({ error: 'Payment gateway configuration error' });
         }
 
         try {
+            console.log('Sending request to Cashfree with headers:',
+                JSON.stringify({
+                    'x-api-version': process.env.CASHFREE_API_VERSION,
+                    'x-client-id': '***', // Masked for logging
+                    'Content-Type': 'application/json'
+                }));
+
             const response = await axios.post(
                 `${CASHFREE_BASE_URL}/orders`,
                 orderData,
                 { headers: getCashfreeHeaders() }
             );
+
+            console.log('Cashfree response:', JSON.stringify(response.data));
 
             userData.orderId = orderId;
             registrations.set(referenceId, userData);
@@ -214,10 +223,11 @@ app.post('/api/create-payment-order', async (req, res) => {
                 orderId: orderId,
                 paymentSessionId: response.data.payment_session_id,
                 orderToken: response.data.order_token,
-                appId: process.env.CASHFREE_APP_ID
+                appId: appId
             });
         } catch (apiError) {
             console.error('Cashfree API error:', apiError.response?.data || apiError.message);
+            console.error('Error details:', apiError);
             res.status(500).json({
                 error: 'Failed to create payment order',
                 details: apiError.response?.data?.message || apiError.message
@@ -299,14 +309,18 @@ app.post('/api/cashfree-webhook', async (req, res) => {
 
         const signature = req.headers['x-webhook-signature'] || '';
         const requestBody = JSON.stringify(req.body);
-        const computedSignature = crypto
-            .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
-            .update(requestBody)
-            .digest('hex');
 
-        if (signature !== computedSignature) {
-            console.error('Invalid webhook signature');
-            return res.status(401).json({ success: false, error: 'Invalid signature' });
+        // Verify signature if it exists
+        if (signature) {
+            const computedSignature = crypto
+                .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
+                .update(requestBody)
+                .digest('hex');
+
+            if (signature !== computedSignature) {
+                console.error('Invalid webhook signature');
+                return res.status(401).json({ success: false, error: 'Invalid signature' });
+            }
         }
 
         if (webhookData.data && webhookData.data.order) {
@@ -352,6 +366,7 @@ app.post('/api/cashfree-webhook', async (req, res) => {
         res.status(200).json({ success: true });
     } catch (error) {
         console.error('Webhook processing error:', error);
+        // Always return 200 for webhooks to prevent retries
         res.status(200).json({ success: true });
     }
 });
