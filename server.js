@@ -15,20 +15,30 @@ const PORT = process.env.PORT || 5000;
 // Middleware
 app.use(cors({
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps)
         const allowedOrigins = [
             'https://inspiringshereen.vercel.app',
             'http://localhost:5173'
         ];
-
+        
+        // For browser preflight requests (OPTIONS), origin might be undefined
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
+            console.log(`Blocked request from origin: ${origin}`);
             callback(new Error('Not allowed by CORS'));
         }
     },
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle OPTIONS preflight requests explicitly
+app.options('*', (req, res) => {
+    res.status(200).end();
+});
+
+app.use(bodyParser.json());
 
 app.use(bodyParser.json());
 
