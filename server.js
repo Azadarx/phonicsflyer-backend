@@ -19,7 +19,7 @@ app.use(cors({
             'https://inspiringshereen.vercel.app',
             'http://localhost:5173'
         ];
-        
+
         // For browser preflight requests (OPTIONS), origin might be undefined
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
@@ -37,8 +37,6 @@ app.use(cors({
 app.options('*', (req, res) => {
     res.status(200).end();
 });
-
-app.use(bodyParser.json());
 
 app.use(bodyParser.json());
 
@@ -223,7 +221,6 @@ app.get('/api/check-payment', (req, res) => {
     }
 });
 
-
 // Function to send confirmation emails
 async function sendConfirmationEmails(userData, referenceId, transactionId) {
     // Send to user
@@ -326,17 +323,6 @@ app.post('/api/confirm-payment', async (req, res) => {
     }
 });
 
-// API endpoint to check if payment is confirmed
-app.get('/api/check-payment', (req, res) => {
-    const referenceId = req.query.reference_id;
-
-    if (confirmedPayments.has(referenceId)) {
-        res.json({ success: true });
-    } else {
-        res.json({ success: false });
-    }
-});
-
 // Add a default route for the API
 app.get('/api', (req, res) => {
     res.json({ message: 'API is running' });
@@ -351,9 +337,8 @@ app.get('/status', (req, res) => {
 app.get('/', (req, res) => {
     res.send('Server is running. API available at /api endpoints.');
 });
+
 // Cashfree webhook handler
-// Update the Cashfree webhook handler in server.js
-// Updated Cashfree webhook handler in server.js
 app.post('/api/cashfree-webhook', async (req, res) => {
     try {
         const webhookData = req.body;
