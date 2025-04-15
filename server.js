@@ -15,10 +15,13 @@ app.use(cors({
     origin: function (origin, callback) {
         const allowedOrigins = [
             'https://inspiringshereen.vercel.app',
-            'http://localhost:5173'
+            'http://localhost:5173',
+            'https://sdk.cashfree.com', // Add Cashfree domain
+            'https://sandbox.cashfree.com', // Add Cashfree sandbox domain
+            'https://api.cashfree.com' // Add Cashfree production domain
         ];
-        
-        if (!origin || allowedOrigins.includes(origin)) {
+
+        if (!origin || allowedOrigins.includes(origin) || origin.includes('cashfree.com')) {
             callback(null, true);
         } else {
             console.log(`Blocked request from origin: ${origin}`);
