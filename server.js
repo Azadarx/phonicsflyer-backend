@@ -4,7 +4,6 @@ const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
-const Razorpay = require('razorpay');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -17,7 +16,7 @@ app.use(cors({
     origin: function (origin, callback) {
         // Allow requests with no origin (like mobile apps)
         const allowedOrigins = [
-            'https://inspiringshereen.vercel.app', // ✅ correct one
+            'https://inspiringshereen.vercel.app',
             'http://localhost:5173'
         ];
 
@@ -32,27 +31,21 @@ app.use(cors({
 
 app.use(bodyParser.json());
 
-// Initialize Razorpay
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_SECRET
-});
-
 // Email transporter
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
-        user: process.env.EMAIL_USER,
+        user : process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASSWORD
     }
 });
 
-// Store successful payments temporarily (in production use a database)
-const successfulPayments = new Set();
-// Store temporary user data
-const userDataStore = new Map();
+// Store user registrations temporarily (in production use a database)
+const registrations = new Map();
+// Store confirmed payments
+const confirmedPayments = new Set();
 
-// API to create Razorpay order
+// API to register a user and generate a unique reference ID
 app.post('/api/register', async (req, res) => {
     try {
         const { fullName, email, phone } = req.body;
@@ -62,186 +55,141 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'All fields are required' });
         }
 
-        // Create Razorpay order
-        const options = {
-            amount: 9900, // 99 rupees in paise
-            currency: 'INR',
-            receipt: `receipt_${Date.now()}`,
-            payment_capture: 1 // Auto capture
-        };
+        // Generate a unique reference ID
+        const referenceId = crypto.randomBytes(6).toString('hex');
+        const timestamp = Date.now();
 
-        const order = await razorpay.orders.create(options);
+        // Store user data
+        registrations.set(referenceId, { 
+            fullName, 
+            email,
+            phone,
+            timestamp,
+            paymentConfirmed: false
+        });
 
-        // Store user data temporarily
-        userDataStore.set(order.id, { fullName, email, phone });
-
-        // Return complete Razorpay configuration
+        // Return reference ID and payment details
         res.json({
-            orderId: order.id,
-            amount: order.amount,
-            key_id: process.env.RAZORPAY_KEY_ID,
-            prefill: {
-                name: fullName,
-                email: email,
-                contact: phone
-            },
-            // Added: UPI configuration for better app redirects
-            config: {
-                display: {
-                    blocks: {
-                        upi: {
-                            name: "Pay via UPI",
-                            instruments: [
-                                {
-                                    method: 'upi'
-                                }
-                            ]
-                        },
-                        card: {
-                            name: "Pay via Card",
-                            instruments: [
-                                {
-                                    method: 'card'
-                                }
-                            ]
-                        },
-                        netbanking: {
-                            name: "Pay via Netbanking",
-                            instruments: [
-                                {
-                                    method: 'netbanking'
-                                }
-                            ]
-                        },
-                        wallet: {
-                            name: "Pay via Wallet",
-                            instruments: [
-                                {
-                                    method: 'wallet'
-                                }
-                            ]
-                        }
-                    },
-                    sequence: ["block.upi", "block.card", "block.netbanking", "block.wallet"],
-                    preferences: {
-                        show_default_blocks: false
-                    }
-                }
+            success: true,
+            referenceId: referenceId,
+            paymentDetails: {
+                upiId: "9494100110@yesbank",
+                name: "Inspiring Shereen",
+                amount: "99",
+                currency: "INR"
             }
         });
 
     } catch (error) {
-        console.error('Order creation error:', error);
+        console.error('Registration error:', error);
         res.status(500).json({ error: 'Something went wrong' });
     }
 });
 
-// API to verify payment signature and process payment
-app.post('/api/verify-payment', async (req, res) => {
+// API to confirm payment
+app.post('/api/confirm-payment', async (req, res) => {
     try {
-        const {
-            razorpay_payment_id,
-            razorpay_order_id,
-            razorpay_signature
-        } = req.body;
+        const { referenceId, transactionId } = req.body;
 
-        // Verify signature
-        const text = `${razorpay_order_id}|${razorpay_payment_id}`;
-        const generated_signature = crypto
-            .createHmac('sha256', process.env.RAZORPAY_SECRET)
-            .update(text)
-            .digest('hex');
-
-        if (generated_signature !== razorpay_signature) {
-            return res.status(400).json({ success: false, error: 'Invalid signature' });
+        // Validate input
+        if (!referenceId || !transactionId) {
+            return res.status(400).json({ error: 'Reference ID and Transaction ID are required' });
         }
 
-        // Payment verified successfully
-        successfulPayments.add(razorpay_payment_id);
+        // Check if reference ID exists
+        if (!registrations.has(referenceId)) {
+            return res.status(404).json({ error: 'Invalid reference ID' });
+        }
 
-        // Get user data from temporary store
-        const userData = userDataStore.get(razorpay_order_id);
+        const userData = registrations.get(referenceId);
+        
+        // In a real application, you might want to verify the payment with your bank
+        // For now, we'll trust the user's confirmation
 
-        if (userData) {
-            // Send confirmation email to user
-            const userMailOptions = {
-                from: process.env.EMAIL_USER,
-                to: userData.email,
-                subject: 'Your Registration is Confirmed! - Inspiring Shereen Masterclass',
-                html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
-            <h2 style="color: #7C3AED; text-align: center;">Thank You for Registering!</h2>
-            <p>Dear ${userData.fullName},</p>
-            <p>Your payment has been successfully processed and your spot in our <strong>Life-Changing 3-Hour Masterclass</strong> is confirmed! 🎉</p>
-            
-            <div style="background-color: #F5F3FF; padding: 15px; border-radius: 10px; margin: 20px 0;">
-              <h3 style="color: #7C3AED; margin-top: 0;">Event Details:</h3>
-              <p>📅 <strong>Date:</strong> April 19th</p>
-              <p>🕦 <strong>Time:</strong> 11:30 AM</p>
-              <p>📍 <strong>Location:</strong> Live on Zoom (Interactive + Reflective Exercises)</p>
-              <p>We'll send you the Zoom link and any additional instructions 24 hours before the event.</p>
+        // Mark payment as confirmed
+        userData.paymentConfirmed = true;
+        userData.transactionId = transactionId;
+        registrations.set(referenceId, userData);
+        
+        // Add to confirmed payments
+        confirmedPayments.add(referenceId);
+
+        // Send confirmation emails
+        // Send to user
+        const userMailOptions = {
+            from: process.env.EMAIL_USER,
+            to: userData.email,
+            subject: 'Your Registration is Confirmed! - Inspiring Shereen Masterclass',
+            html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #333;">
+                <h2 style="color: #7C3AED; text-align: center;">Thank You for Registering!</h2>
+                <p>Dear ${userData.fullName},</p>
+                <p>Your payment has been successfully processed and your spot in our <strong>Life-Changing 3-Hour Masterclass</strong> is confirmed! 🎉</p>
+                
+                <div style="background-color: #F5F3FF; padding: 15px; border-radius: 10px; margin: 20px 0;">
+                <h3 style="color: #7C3AED; margin-top: 0;">Event Details:</h3>
+                <p>📅 <strong>Date:</strong> April 19th</p>
+                <p>🕦 <strong>Time:</strong> 11:30 AM</p>
+                <p>📍 <strong>Location:</strong> Live on Zoom (Interactive + Reflective Exercises)</p>
+                <p>We'll send you the Zoom link and any additional instructions 24 hours before the event.</p>
+                </div>
+                
+                <p>Get ready to break free from stress, confusion & setbacks and take control of your life with clarity and confidence! ✨</p>
+                
+                <p>If you have any questions before the masterclass, feel free to reply to this email.</p>
+                
+                <p>Looking forward to helping you transform your life!</p>
+                
+                <p style="margin-bottom: 0;">Warm regards,</p>
+                <p style="margin-top: 5px;"><strong>Inspiring Shereen</strong></p>
+                <p style="color: #7C3AED;">Life Coach | Shaping Lives With Holistic Success</p>
             </div>
-            
-            <p>Get ready to break free from stress, confusion & setbacks and take control of your life with clarity and confidence! ✨</p>
-            
-            <p>If you have any questions before the masterclass, feel free to reply to this email.</p>
-            
-            <p>Looking forward to helping you transform your life!</p>
-            
-            <p style="margin-bottom: 0;">Warm regards,</p>
-            <p style="margin-top: 5px;"><strong>Inspiring Shereen</strong></p>
-            <p style="color: #7C3AED;">Life Coach | Shaping Lives With Holistic Success</p>
-          </div>
-        `
-            };
+            `
+        };
 
-            // Send email to admin
-            const adminMailOptions = {
-                from: process.env.EMAIL_USER,
-                to: process.env.EMAIL_USER,
-                subject: 'New Registration - Inspiring Shereen Masterclass',
-                html: `
-          <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-            <h2 style="color: #7C3AED;">New Registration!</h2>
-            <p>A new participant has registered for the Life Coaching Masterclass:</p>
-            
-            <ul>
-              <li><strong>Full Name:</strong> ${userData.fullName}</li>
-              <li><strong>Email:</strong> ${userData.email}</li>
-              <li><strong>Phone:</strong> ${userData.phone}</li>
-              <li><strong>Payment ID:</strong> ${razorpay_payment_id}</li>
-              <li><strong>Order ID:</strong> ${razorpay_order_id}</li>
-              <li><strong>Amount Paid:</strong> ₹99</li>
-            </ul>
-          </div>
-        `
-            };
+        // Send to admin
+        const adminMailOptions = {
+            from: process.env.EMAIL_USER,
+            to: process.env.EMAIL_USER,
+            subject: 'New Registration - Inspiring Shereen Masterclass',
+            html: `
+            <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+                <h2 style="color: #7C3AED;">New Registration!</h2>
+                <p>A new participant has registered for the Life Coaching Masterclass:</p>
+                
+                <ul>
+                <li><strong>Full Name:</strong> ${userData.fullName}</li>
+                <li><strong>Email:</strong> ${userData.email}</li>
+                <li><strong>Phone:</strong> ${userData.phone}</li>
+                <li><strong>Reference ID:</strong> ${referenceId}</li>
+                <li><strong>Transaction ID:</strong> ${transactionId}</li>
+                <li><strong>Amount Paid:</strong> ₹99</li>
+                </ul>
+            </div>
+            `
+        };
 
-            try {
-                await transporter.sendMail(userMailOptions);
-                await transporter.sendMail(adminMailOptions);
-            } catch (emailError) {
-                console.error('Email sending error:', emailError);
-                // Don't fail the request if email fails
-            }
-
-            // Clean up temporary data
-            userDataStore.delete(razorpay_order_id);
+        try {
+            await transporter.sendMail(userMailOptions);
+            await transporter.sendMail(adminMailOptions);
+        } catch (emailError) {
+            console.error('Email sending error:', emailError);
+            // Don't fail the request if email fails
         }
 
-        res.json({ success: true });
+        res.json({ success: true, referenceId });
 
     } catch (error) {
-        console.error('Payment verification error:', error);
-        res.status(500).json({ success: false, error: 'Something went wrong' });
+        console.error('Payment confirmation error:', error);
+        res.status(500).json({ error: 'Something went wrong' });
     }
 });
 
-// API endpoint to check if payment is authentic
+// API endpoint to check if payment is confirmed
 app.get('/api/check-payment', (req, res) => {
-    const paymentId = req.query.payment_id;
+    const referenceId = req.query.reference_id;
 
-    if (successfulPayments.has(paymentId)) {
+    if (confirmedPayments.has(referenceId)) {
         res.json({ success: true });
     } else {
         res.json({ success: false });
