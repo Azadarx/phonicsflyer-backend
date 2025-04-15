@@ -3,11 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const path = require('path');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
-const fs = require('fs');
-const axios = require('axios'); // Make sure to install axios
+const axios = require('axios');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -19,8 +17,7 @@ app.use(cors({
             'https://inspiringshereen.vercel.app',
             'http://localhost:5173'
         ];
-
-        // For browser preflight requests (OPTIONS), origin might be undefined
+        
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
@@ -32,11 +29,6 @@ app.use(cors({
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
-
-// Handle OPTIONS preflight requests explicitly
-app.options('*', (req, res) => {
-    res.status(200).end();
-});
 
 app.use(bodyParser.json());
 
@@ -69,161 +61,8 @@ const getCashfreeHeaders = () => {
     };
 };
 
-// API to register a user and generate a unique reference ID
-app.post('/api/register', async (req, res) => {
-    try {
-        const { fullName, email, phone } = req.body;
-
-        // Validate input
-        if (!fullName || !email || !phone) {
-            return res.status(400).json({ error: 'All fields are required' });
-        }
-
-        // Generate a unique reference ID
-        const referenceId = crypto.randomBytes(6).toString('hex');
-        const timestamp = Date.now();
-
-        // Store user data
-        registrations.set(referenceId, {
-            fullName,
-            email,
-            phone,
-            timestamp,
-            paymentConfirmed: false
-        });
-
-        // Return reference ID and payment details
-        res.json({
-            success: true,
-            referenceId: referenceId,
-            paymentDetails: {
-                upiId: "9494100110@yesbank",
-                name: "Inspiring Shereen",
-                amount: "99",
-                currency: "INR"
-            }
-        });
-
-    } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({ error: 'Something went wrong' });
-    }
-});
-
-// Enhanced create-payment-order endpoint with better error handling
-app.post('/api/create-payment-order', async (req, res) => {
-    try {
-        const { referenceId } = req.body;
-
-        // Validate input
-        if (!referenceId) {
-            return res.status(400).json({ error: 'Reference ID is required' });
-        }
-
-        // Check if reference ID exists
-        if (!registrations.has(referenceId)) {
-            return res.status(404).json({ error: 'Invalid reference ID' });
-        }
-
-        const userData = registrations.get(referenceId);
-        const orderId = `ORDER_${referenceId}_${Date.now()}`;
-
-        // Create payment order with Cashfree
-        const orderData = {
-            order_id: orderId,
-            order_amount: 99,
-            order_currency: "INR",
-            customer_details: {
-                customer_id: referenceId,
-                customer_name: userData.fullName,
-                customer_email: userData.email,
-                customer_phone: userData.phone
-            },
-            order_meta: {
-                return_url: `${process.env.FRONTEND_URL || 'https://inspiringshereen.vercel.app'}/success?reference_id=${referenceId}`
-            }
-        };
-
-        // Check if Cashfree credentials are configured
-        if (!process.env.CASHFREE_APP_ID || !process.env.CASHFREE_SECRET_KEY) {
-            console.error('Cashfree credentials not configured');
-            return res.status(500).json({ error: 'Payment gateway configuration error' });
-        }
-
-        try {
-            const response = await axios.post(
-                `${CASHFREE_BASE_URL}/orders`,
-                orderData,
-                { headers: getCashfreeHeaders() }
-            );
-
-            // Store order ID with user data
-            userData.orderId = orderId;
-            registrations.set(referenceId, userData);
-
-            res.json({
-                success: true,
-                orderId: orderId,
-                paymentSessionId: response.data.payment_session_id,
-                orderToken: response.data.order_token,
-                appId: process.env.CASHFREE_APP_ID
-            });
-        } catch (apiError) {
-            console.error('Cashfree API error:', apiError.response?.data || apiError.message);
-            res.status(500).json({
-                error: 'Failed to create payment order',
-                details: apiError.response?.data?.message || apiError.message
-            });
-        }
-    } catch (error) {
-        console.error('Payment order creation error:', error);
-        res.status(500).json({
-            error: 'Server error while creating payment order'
-        });
-    }
-});
-
-// Enhanced check-payment-status endpoint
-app.get('/api/check-payment', (req, res) => {
-    try {
-        const referenceId = req.query.reference_id;
-
-        if (!referenceId) {
-            return res.status(400).json({
-                success: false,
-                error: 'Reference ID is required'
-            });
-        }
-
-        if (confirmedPayments.has(referenceId)) {
-            res.json({ success: true });
-        } else if (registrations.has(referenceId)) {
-            // Payment pending but registration exists
-            res.json({
-                success: false,
-                status: 'PENDING',
-                message: 'Payment is being processed'
-            });
-        } else {
-            // Unknown reference ID
-            res.json({
-                success: false,
-                status: 'UNKNOWN',
-                message: 'Invalid reference ID'
-            });
-        }
-    } catch (error) {
-        console.error('Check payment error:', error);
-        res.status(500).json({
-            success: false,
-            error: 'Server error while checking payment'
-        });
-    }
-});
-
 // Function to send confirmation emails
 async function sendConfirmationEmails(userData, referenceId, transactionId) {
-    // Send to user
     const userMailOptions = {
         from: process.env.EMAIL_USER,
         to: userData.email,
@@ -255,7 +94,6 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
         `
     };
 
-    // Send to admin
     const adminMailOptions = {
         from: process.env.EMAIL_USER,
         to: process.env.EMAIL_USER,
@@ -287,68 +125,176 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
     }
 }
 
-// Legacy API to confirm payment (keep for compatibility)
-app.post('/api/confirm-payment', async (req, res) => {
+// API Routes
+app.post('/api/register', async (req, res) => {
     try {
-        const { referenceId, transactionId } = req.body;
+        const { fullName, email, phone } = req.body;
 
-        // Validate input
-        if (!referenceId || !transactionId) {
-            return res.status(400).json({ error: 'Reference ID and Transaction ID are required' });
+        if (!fullName || !email || !phone) {
+            return res.status(400).json({ error: 'All fields are required' });
         }
 
-        // Check if reference ID exists
+        const referenceId = crypto.randomBytes(6).toString('hex');
+        const timestamp = Date.now();
+
+        registrations.set(referenceId, {
+            fullName,
+            email,
+            phone,
+            timestamp,
+            paymentConfirmed: false
+        });
+
+        res.json({
+            success: true,
+            referenceId: referenceId,
+            paymentDetails: {
+                upiId: "9494100110@yesbank",
+                name: "Inspiring Shereen",
+                amount: "99",
+                currency: "INR"
+            }
+        });
+    } catch (error) {
+        console.error('Registration error:', error);
+        res.status(500).json({ error: 'Something went wrong' });
+    }
+});
+
+app.post('/api/create-payment-order', async (req, res) => {
+    try {
+        const { referenceId } = req.body;
+
+        if (!referenceId) {
+            return res.status(400).json({ error: 'Reference ID is required' });
+        }
+
         if (!registrations.has(referenceId)) {
             return res.status(404).json({ error: 'Invalid reference ID' });
         }
 
         const userData = registrations.get(referenceId);
+        const orderId = `ORDER_${referenceId}_${Date.now()}`;
 
-        // Mark payment as confirmed
+        const orderData = {
+            order_id: orderId,
+            order_amount: 99,
+            order_currency: "INR",
+            customer_details: {
+                customer_id: referenceId,
+                customer_name: userData.fullName,
+                customer_email: userData.email,
+                customer_phone: userData.phone
+            },
+            order_meta: {
+                return_url: `${process.env.FRONTEND_URL || 'https://inspiringshereen.vercel.app'}/success?reference_id=${referenceId}`
+            }
+        };
+
+        if (!process.env.CASHFREE_APP_ID || !process.env.CASHFREE_SECRET_KEY) {
+            console.error('Cashfree credentials not configured');
+            return res.status(500).json({ error: 'Payment gateway configuration error' });
+        }
+
+        try {
+            const response = await axios.post(
+                `${CASHFREE_BASE_URL}/orders`,
+                orderData,
+                { headers: getCashfreeHeaders() }
+            );
+
+            userData.orderId = orderId;
+            registrations.set(referenceId, userData);
+
+            res.json({
+                success: true,
+                orderId: orderId,
+                paymentSessionId: response.data.payment_session_id,
+                orderToken: response.data.order_token,
+                appId: process.env.CASHFREE_APP_ID
+            });
+        } catch (apiError) {
+            console.error('Cashfree API error:', apiError.response?.data || apiError.message);
+            res.status(500).json({
+                error: 'Failed to create payment order',
+                details: apiError.response?.data?.message || apiError.message
+            });
+        }
+    } catch (error) {
+        console.error('Payment order creation error:', error);
+        res.status(500).json({
+            error: 'Server error while creating payment order'
+        });
+    }
+});
+
+app.get('/api/check-payment', (req, res) => {
+    try {
+        const referenceId = req.query.reference_id;
+
+        if (!referenceId) {
+            return res.status(400).json({
+                success: false,
+                error: 'Reference ID is required'
+            });
+        }
+
+        if (confirmedPayments.has(referenceId)) {
+            res.json({ success: true });
+        } else if (registrations.has(referenceId)) {
+            res.json({
+                success: false,
+                status: 'PENDING',
+                message: 'Payment is being processed'
+            });
+        } else {
+            res.json({
+                success: false,
+                status: 'UNKNOWN',
+                message: 'Invalid reference ID'
+            });
+        }
+    } catch (error) {
+        console.error('Check payment error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Server error while checking payment'
+        });
+    }
+});
+
+app.post('/api/confirm-payment', async (req, res) => {
+    try {
+        const { referenceId, transactionId } = req.body;
+
+        if (!referenceId || !transactionId) {
+            return res.status(400).json({ error: 'Reference ID and Transaction ID are required' });
+        }
+
+        if (!registrations.has(referenceId)) {
+            return res.status(404).json({ error: 'Invalid reference ID' });
+        }
+
+        const userData = registrations.get(referenceId);
         userData.paymentConfirmed = true;
         userData.transactionId = transactionId;
         registrations.set(referenceId, userData);
-
-        // Add to confirmed payments
         confirmedPayments.add(referenceId);
 
-        // Send confirmation emails
         await sendConfirmationEmails(userData, referenceId, transactionId);
-
         res.json({ success: true, referenceId });
-
     } catch (error) {
         console.error('Payment confirmation error:', error);
         res.status(500).json({ error: 'Something went wrong' });
     }
 });
 
-// Add a default route for the API
-app.get('/api', (req, res) => {
-    res.json({ message: 'API is running' });
-});
-
-// Add a simple status check route
-app.get('/status', (req, res) => {
-    res.json({ status: 'Server is running' });
-});
-
-// Default route to show server is working
-app.get('/', (req, res) => {
-    res.send('Server is running. API available at /api endpoints.');
-});
-
-// Cashfree webhook handler
 app.post('/api/cashfree-webhook', async (req, res) => {
     try {
         const webhookData = req.body;
         console.log('Received Cashfree webhook:', JSON.stringify(webhookData));
 
-        // Validate webhook signature for security
         const signature = req.headers['x-webhook-signature'] || '';
-
-        // IMPORTANT: Always verify webhook signatures in production
-        // Uncomment this in production
         const requestBody = JSON.stringify(req.body);
         const computedSignature = crypto
             .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
@@ -360,8 +306,6 @@ app.post('/api/cashfree-webhook', async (req, res) => {
             return res.status(401).json({ success: false, error: 'Invalid signature' });
         }
 
-
-        // Process the webhook based on event type
         if (webhookData.data && webhookData.data.order) {
             const orderId = webhookData.data.order.order_id;
             const orderStatus = webhookData.data.order.order_status;
@@ -369,7 +313,6 @@ app.post('/api/cashfree-webhook', async (req, res) => {
             console.log(`Processing webhook for order ${orderId} with status ${orderStatus}`);
 
             if (orderStatus === 'PAID') {
-                // Find the reference ID associated with this order
                 let referenceId = null;
                 for (const [key, value] of registrations.entries()) {
                     if (value.orderId === orderId) {
@@ -385,7 +328,6 @@ app.post('/api/cashfree-webhook', async (req, res) => {
                     registrations.set(referenceId, userData);
                     confirmedPayments.add(referenceId);
 
-                    // Send confirmation emails
                     try {
                         await sendConfirmationEmails(
                             userData,
@@ -404,15 +346,27 @@ app.post('/api/cashfree-webhook', async (req, res) => {
             }
         }
 
-        // Always return 200 to Cashfree
         res.status(200).json({ success: true });
     } catch (error) {
         console.error('Webhook processing error:', error);
-        // Always return 200 to Cashfree even if there's an error on our side
         res.status(200).json({ success: true });
     }
 });
 
+// Basic routes
+app.get('/api', (req, res) => {
+    res.json({ message: 'API is running' });
+});
+
+app.get('/status', (req, res) => {
+    res.json({ status: 'Server is running' });
+});
+
+app.get('/', (req, res) => {
+    res.send('Server is running. API available at /api endpoints.');
+});
+
+// Start server
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
