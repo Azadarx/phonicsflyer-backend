@@ -68,13 +68,19 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
             
             <p>Get ready to break free from stress, confusion & setbacks and take control of your life with clarity and confidence! ✨</p>
             
-            <p>If you have any questions before the masterclass, feel free to reply to this email.</p>
+            <p>If you have any questions before the masterclass, feel free to reply to this email or reach out on WhatsApp: <a href="https://wa.me/919951611674">Click here to chat on WhatsApp</a></p>
             
             <p>Looking forward to helping you transform your life!</p>
             
             <p style="margin-bottom: 0;">Warm regards,</p>
             <p style="margin-top: 5px;"><strong>Inspiring Shereen</strong></p>
             <p style="color: #7C3AED;">Life Coach | Shaping Lives With Holistic Success</p>
+            
+            <div style="text-align: center; margin-top: 20px;">
+                <a href="https://wa.me/919951611674" style="display: inline-block; background-color: #25D366; color: white; text-decoration: none; padding: 10px 20px; border-radius: 5px; font-weight: bold;">
+                    Connect on WhatsApp
+                </a>
+            </div>
         </div>
         `
     };
@@ -96,6 +102,8 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
             <li><strong>Transaction ID:</strong> ${transactionId}</li>
             <li><strong>Amount Paid:</strong> ₹99</li>
             </ul>
+            
+            <p><a href="https://wa.me/${userData.phone.replace(/\D/g, '')}">Contact participant on WhatsApp</a></p>
         </div>
         `
     };
@@ -166,7 +174,7 @@ app.post('/api/create-payment-order', async (req, res) => {
         
         // Get Razorpay instance (using axios to create order)
         const orderData = {
-            amount: 100, // amount in paisa (99 INR)
+            amount: 9900, // amount in paisa (99 INR)
             currency: "INR",
             receipt: `receipt_${referenceId}`,
             notes: {
@@ -333,7 +341,7 @@ app.post('/api/razorpay-webhook', async (req, res) => {
             }
         }
 
-        // Process payment success
+        // Process payment success - ONLY sending emails for successful payment events
         if (webhookData.event === 'payment.captured' || webhookData.event === 'payment.authorized') {
             const paymentData = webhookData.payload.payment.entity;
             const orderId = paymentData.order_id;
@@ -355,7 +363,7 @@ app.post('/api/razorpay-webhook', async (req, res) => {
                 registrations.set(referenceId, userData);
                 confirmedPayments.add(referenceId);
                 
-                // Send confirmation emails
+                // Send confirmation emails ONLY for successful payments
                 try {
                     await sendConfirmationEmails(userData, referenceId, paymentId);
                     console.log(`Confirmation emails sent for reference ID: ${referenceId}`);
@@ -365,6 +373,9 @@ app.post('/api/razorpay-webhook', async (req, res) => {
             } else {
                 console.error(`Could not find referenceId for order ${orderId}`);
             }
+        } else if (webhookData.event === 'payment.failed') {
+            console.log('Payment failed - no emails will be sent');
+            // Do not send any emails for failed payments
         }
         
         // Always return 200 for webhooks to acknowledge receipt
@@ -375,7 +386,6 @@ app.post('/api/razorpay-webhook', async (req, res) => {
         res.status(200).json({ success: true });
     }
 });
-
 // Basic routes
 app.get('/api', (req, res) => {
     res.json({ message: 'API is running' });
