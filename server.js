@@ -317,7 +317,7 @@ app.post('/api/confirm-payment', async (req, res) => {
     }
 });
 
-app.post('/api/razorpay-webhook', async (req, res) => {
+app.post('/api/inspiringshereen-webhook', async (req, res) => {
     try {
         const webhookData = req.body;
         console.log('Received Razorpay webhook:', JSON.stringify(webhookData));
@@ -386,7 +386,8 @@ app.post('/api/razorpay-webhook', async (req, res) => {
         res.status(200).json({ success: true });
     }
 });
-// Basic routes
+
+
 app.get('/api', (req, res) => {
     res.json({ message: 'API is running' });
 });
