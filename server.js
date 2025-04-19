@@ -174,7 +174,7 @@ app.post('/api/create-payment-order', async (req, res) => {
         
         // Get Razorpay instance (using axios to create order)
         const orderData = {
-            amount: 9900, // amount in paisa (99 INR)
+            amount: 100, // amount in paisa (99 INR)
             currency: "INR",
             receipt: `receipt_${referenceId}`,
             notes: {
