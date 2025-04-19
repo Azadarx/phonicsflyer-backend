@@ -6,9 +6,31 @@ const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const axios = require('axios');
+const admin = require('firebase-admin');
+
+// Initialize Firebase Admin SDK
+// You'll need to create a service account key in Firebase console and save it
+let serviceAccount;
+try {
+    // Try to load service account from environment variables (for production)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } else {
+        // Fallback to local file for development
+        serviceAccount = require('./firebase-service-account.json');
+    }
+
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+} catch (error) {
+    console.error('Firebase admin initialization error:', error);
+    // Continue without Firebase Admin if not configured
+}
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const db = admin.firestore ? admin.firestore() : null;
 
 // Middleware
 app.use(cors({
@@ -28,6 +50,28 @@ app.use((req, res, next) => {
 
 app.use(bodyParser.json());
 
+// Firebase Auth Middleware
+const verifyFirebaseToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ') || !admin.auth) {
+        // Skip verification if no token or Firebase Admin not initialized
+        return next();
+    }
+
+    const token = authHeader.split('Bearer ')[1];
+
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = decodedToken;
+        next();
+    } catch (error) {
+        console.error('Error verifying Firebase token:', error);
+        // Continue without user verification
+        next();
+    }
+};
+
 // Email transporter
 const transporter = nodemailer.createTransport({
     service: 'gmail',
@@ -45,6 +89,44 @@ const confirmedPayments = new Set();
 // Razorpay configuration
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+// Function to save registration to Firestore
+async function saveRegistrationToFirestore(userId, registrationData) {
+    if (!db) return false;
+
+    try {
+        // If userId provided, save to user's document
+        if (userId) {
+            const userRef = db.collection('users').doc(userId);
+            const userDoc = await userRef.get();
+
+            if (userDoc.exists) {
+                const userData = userDoc.data();
+                const registrations = userData.registrations || [];
+
+                // Add new registration
+                registrations.push({
+                    ...registrationData,
+                    timestamp: new Date().toISOString()
+                });
+
+                // Update user document
+                await userRef.update({ registrations });
+            }
+        }
+
+        // Save to registrations collection regardless of user
+        await db.collection('registrations').doc(registrationData.referenceId).set({
+            ...registrationData,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        return true;
+    } catch (error) {
+        console.error('Firestore save error:', error);
+        return false;
+    }
+}
 
 // Function to send confirmation emails
 async function sendConfirmationEmails(userData, referenceId, transactionId) {
@@ -124,12 +206,12 @@ function verifyRazorpaySignature(orderId, paymentId, signature) {
         .createHmac('sha256', RAZORPAY_KEY_SECRET)
         .update(orderId + '|' + paymentId)
         .digest('hex');
-    
+
     return generatedSignature === signature;
 }
 
-// API Routes
-app.post('/api/register', async (req, res) => {
+// API Routes - Apply Firebase verification where needed
+app.post('/api/register', verifyFirebaseToken, async (req, res) => {
     try {
         const { fullName, email, phone } = req.body;
 
@@ -140,13 +222,32 @@ app.post('/api/register', async (req, res) => {
         const referenceId = crypto.randomBytes(6).toString('hex');
         const timestamp = Date.now();
 
+        // Save in local memory
         registrations.set(referenceId, {
             fullName,
             email,
             phone,
             timestamp,
-            paymentConfirmed: false
+            paymentConfirmed: false,
+            userId: req.user?.uid || null
         });
+
+        // Save in Firestore if available
+        if (db) {
+            try {
+                await saveRegistrationToFirestore(req.user?.uid, {
+                    referenceId,
+                    fullName,
+                    email,
+                    phone,
+                    timestamp,
+                    paymentConfirmed: false
+                });
+            } catch (firestoreError) {
+                console.error('Firestore save error:', firestoreError);
+                // Continue with local storage even if Firestore fails
+            }
+        }
 
         res.json({
             success: true,
@@ -158,7 +259,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/create-payment-order', async (req, res) => {
+app.post('/api/create-payment-order', verifyFirebaseToken, async (req, res) => {
     try {
         const { referenceId } = req.body;
 
@@ -171,7 +272,7 @@ app.post('/api/create-payment-order', async (req, res) => {
         }
 
         const userData = registrations.get(referenceId);
-        
+
         // Get Razorpay instance (using axios to create order)
         const orderData = {
             amount: 100, // amount in paisa (99 INR)
@@ -181,7 +282,8 @@ app.post('/api/create-payment-order', async (req, res) => {
                 referenceId: referenceId,
                 customerName: userData.fullName,
                 customerEmail: userData.email,
-                customerPhone: userData.phone
+                customerPhone: userData.phone,
+                userId: req.user?.uid || userData.userId || null
             }
         };
 
@@ -202,7 +304,7 @@ app.post('/api/create-payment-order', async (req, res) => {
             );
 
             const { id: orderId } = response.data;
-            
+
             // Store order ID in user data
             userData.orderId = orderId;
             registrations.set(referenceId, userData);
@@ -227,7 +329,7 @@ app.post('/api/create-payment-order', async (req, res) => {
     }
 });
 
-app.get('/api/check-payment', (req, res) => {
+app.get('/api/check-payment', verifyFirebaseToken, (req, res) => {
     try {
         const referenceId = req.query.reference_id;
 
@@ -247,11 +349,35 @@ app.get('/api/check-payment', (req, res) => {
                 message: 'Payment is being processed'
             });
         } else {
-            res.json({
-                success: false,
-                status: 'UNKNOWN',
-                message: 'Invalid reference ID'
-            });
+            // Try to check in Firestore if available
+            if (db) {
+                db.collection('registrations').doc(referenceId).get()
+                    .then(doc => {
+                        if (doc.exists && doc.data().paymentConfirmed) {
+                            res.json({ success: true });
+                        } else {
+                            res.json({
+                                success: false,
+                                status: 'UNKNOWN',
+                                message: 'Invalid reference ID or payment not confirmed'
+                            });
+                        }
+                    })
+                    .catch(err => {
+                        console.error('Firestore fetch error:', err);
+                        res.json({
+                            success: false,
+                            status: 'UNKNOWN',
+                            message: 'Invalid reference ID'
+                        });
+                    });
+            } else {
+                res.json({
+                    success: false,
+                    status: 'UNKNOWN',
+                    message: 'Invalid reference ID'
+                });
+            }
         }
     } catch (error) {
         console.error('Check payment error:', error);
@@ -262,18 +388,18 @@ app.get('/api/check-payment', (req, res) => {
     }
 });
 
-app.post('/api/confirm-payment', async (req, res) => {
+app.post('/api/confirm-payment', verifyFirebaseToken, async (req, res) => {
     try {
-        const { 
-            razorpay_payment_id, 
-            razorpay_order_id, 
-            razorpay_signature, 
-            referenceId 
+        const {
+            razorpay_payment_id,
+            razorpay_order_id,
+            razorpay_signature,
+            referenceId
         } = req.body;
 
         if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !referenceId) {
-            return res.status(400).json({ 
-                error: 'Payment details are incomplete' 
+            return res.status(400).json({
+                error: 'Payment details are incomplete'
             });
         }
 
@@ -285,34 +411,85 @@ app.post('/api/confirm-payment', async (req, res) => {
         );
 
         if (!isSignatureValid) {
-            return res.status(400).json({ 
-                error: 'Invalid payment signature' 
+            return res.status(400).json({
+                error: 'Invalid payment signature'
             });
         }
 
-        if (!registrations.has(referenceId)) {
-            return res.status(404).json({ 
-                error: 'Invalid reference ID' 
+        let userData;
+        if (registrations.has(referenceId)) {
+            userData = registrations.get(referenceId);
+        } else if (db) {
+            // Try to fetch from Firestore
+            const doc = await db.collection('registrations').doc(referenceId).get();
+            if (doc.exists) {
+                userData = doc.data();
+            } else {
+                return res.status(404).json({
+                    error: 'Invalid reference ID'
+                });
+            }
+        } else {
+            return res.status(404).json({
+                error: 'Invalid reference ID'
             });
         }
 
-        const userData = registrations.get(referenceId);
+        // Update payment information
         userData.paymentConfirmed = true;
         userData.transactionId = razorpay_payment_id;
-        registrations.set(referenceId, userData);
+
+        if (registrations.has(referenceId)) {
+            registrations.set(referenceId, userData);
+        }
         confirmedPayments.add(referenceId);
+
+        // Update in Firestore if available
+        if (db) {
+            try {
+                await db.collection('registrations').doc(referenceId).update({
+                    paymentConfirmed: true,
+                    transactionId: razorpay_payment_id,
+                    paymentDate: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                // Update in user's document if userId available
+                const userId = userData.userId || req.user?.uid;
+                if (userId) {
+                    const userRef = db.collection('users').doc(userId);
+                    const userDoc = await userRef.get();
+
+                    if (userDoc.exists) {
+                        const userData = userDoc.data();
+                        const registrations = userData.registrations || [];
+
+                        // Find and update the registration
+                        const registrationIndex = registrations.findIndex(r => r.referenceId === referenceId);
+                        if (registrationIndex !== -1) {
+                            registrations[registrationIndex].paymentConfirmed = true;
+                            registrations[registrationIndex].transactionId = razorpay_payment_id;
+
+                            await userRef.update({ registrations });
+                        }
+                    }
+                }
+            } catch (firestoreError) {
+                console.error('Firestore update error:', firestoreError);
+                // Continue even if Firestore update fails
+            }
+        }
 
         // Send confirmation emails
         await sendConfirmationEmails(userData, referenceId, razorpay_payment_id);
-        
-        res.json({ 
-            success: true, 
-            referenceId 
+
+        res.json({
+            success: true,
+            referenceId
         });
     } catch (error) {
         console.error('Payment confirmation error:', error);
-        res.status(500).json({ 
-            error: 'Something went wrong during payment confirmation' 
+        res.status(500).json({
+            error: 'Something went wrong during payment confirmation'
         });
     }
 });
@@ -324,16 +501,16 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
 
         // Verify webhook signature
         const webhookSignature = req.headers['x-razorpay-signature'];
-        
+
         if (webhookSignature) {
             const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-            
+
             if (webhookSecret) {
                 const generatedSignature = crypto
                     .createHmac('sha256', webhookSecret)
                     .update(JSON.stringify(req.body))
                     .digest('hex');
-                
+
                 if (generatedSignature !== webhookSignature) {
                     console.error('Invalid webhook signature');
                     return res.status(401).json({ success: false, error: 'Invalid signature' });
@@ -346,23 +523,81 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
             const paymentData = webhookData.payload.payment.entity;
             const orderId = paymentData.order_id;
             const paymentId = paymentData.id;
-            
+
             // Find the reference ID from the order ID
             let referenceId = null;
+            let userData = null;
+
+            // Check local memory
             for (const [key, value] of registrations.entries()) {
                 if (value.orderId === orderId) {
                     referenceId = key;
+                    userData = value;
                     break;
                 }
             }
-            
-            if (referenceId) {
-                const userData = registrations.get(referenceId);
-                userData.paymentConfirmed = true;
-                userData.transactionId = paymentId;
-                registrations.set(referenceId, userData);
+
+            // If not found in memory, check Firestore
+            if (!referenceId && db) {
+                try {
+                    const registrationsSnapshot = await db.collection('registrations')
+                        .where('orderId', '==', orderId)
+                        .limit(1)
+                        .get();
+
+                    if (!registrationsSnapshot.empty) {
+                        const doc = registrationsSnapshot.docs[0];
+                        referenceId = doc.id;
+                        userData = doc.data();
+                    }
+                } catch (firestoreError) {
+                    console.error('Firestore query error:', firestoreError);
+                }
+            }
+
+            if (referenceId && userData) {
+                // Update in memory if available
+                if (registrations.has(referenceId)) {
+                    userData.paymentConfirmed = true;
+                    userData.transactionId = paymentId;
+                    registrations.set(referenceId, userData);
+                }
                 confirmedPayments.add(referenceId);
-                
+
+                // Update in Firestore if available
+                if (db) {
+                    try {
+                        await db.collection('registrations').doc(referenceId).update({
+                            paymentConfirmed: true,
+                            transactionId: paymentId,
+                            paymentDate: admin.firestore.FieldValue.serverTimestamp()
+                        });
+
+                        // Update in user's document if userId available
+                        const userId = userData.userId;
+                        if (userId) {
+                            const userRef = db.collection('users').doc(userId);
+                            const userDoc = await userRef.get();
+
+                            if (userDoc.exists) {
+                                const userData = userDoc.data();
+                                const registrations = userData.registrations || [];
+
+                                // Find and update the registration
+                                const registrationIndex = registrations.findIndex(r => r.referenceId === referenceId);
+                                if (registrationIndex !== -1) {
+                                    registrations[registrationIndex].paymentConfirmed = true;
+                                    registrations[registrationIndex].transactionId = paymentId;
+
+                                    await userRef.update({ registrations });
+                                }
+                            }
+                        }
+                    } catch (firestoreError) {
+                        console.error('Firestore update error:', firestoreError);
+                    }
+                }
+
                 // Send confirmation emails ONLY for successful payments
                 try {
                     await sendConfirmationEmails(userData, referenceId, paymentId);
@@ -377,7 +612,7 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
             console.log('Payment failed - no emails will be sent');
             // Do not send any emails for failed payments
         }
-        
+
         // Always return 200 for webhooks to acknowledge receipt
         res.status(200).json({ success: true });
     } catch (error) {
@@ -387,6 +622,41 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
     }
 });
 
+// Admin routes - secured with Firebase Auth
+app.get('/api/admin/registrations', verifyFirebaseToken, async (req, res) => {
+    // Check if user is authenticated and has admin role
+    if (!req.user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    try {
+        let registrationsData = [];
+
+        // If Firestore is available, get data from there
+        if (db) {
+            const snapshot = await db.collection('registrations').orderBy('createdAt', 'desc').get();
+            registrationsData = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data(),
+                createdAt: doc.data().createdAt?.toDate() || null
+            }));
+        } else {
+            // Otherwise use in-memory data
+            registrationsData = Array.from(registrations.entries()).map(([key, value]) => ({
+                id: key,
+                ...value
+            }));
+        }
+
+        res.json({
+            success: true,
+            registrations: registrationsData
+        });
+    } catch (error) {
+        console.error('Admin registrations fetch error:', error);
+        res.status(500).json({ error: 'Something went wrong' });
+    }
+});
 
 app.get('/api', (req, res) => {
     res.json({ message: 'API is running' });
