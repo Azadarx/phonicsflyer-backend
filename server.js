@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -7,33 +6,39 @@ const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const axios = require('axios');
 const admin = require('firebase-admin');
+const Razorpay = require('razorpay'); // Make sure this is installed
+
+// Initialize Razorpay
+const razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 
 // Initialize Firebase Admin SDK
-// You'll need to create a service account key in Firebase console and save it
-let serviceAccount;
-try {
-    // Try to load service account from environment variables (for production)
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    } else {
-        // Fallback to local file for development
-        serviceAccount = require('./firebase-service-account.json');
-    }
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
     admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
+        credential: admin.credential.cert(serviceAccount),
+        databaseURL: `https://${serviceAccount.project_id}-default-rtdb.firebaseio.com`
     });
-} catch (error) {
-    console.error('Firebase admin initialization error:', error);
-    // Continue without Firebase Admin if not configured
+} else {
+    console.error('Firebase service account not found in environment variables');
+    process.exit(1);
 }
+
+// Get a database reference
+const db = admin.database();
+const registrationsRef = db.ref('registrations');
+const confirmedPaymentsRef = db.ref('confirmedPayments');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const db = admin.firestore ? admin.firestore() : null;
 
 // Middleware
 app.use(cors({
+    // origin: ["http://localhost:3000", "http://localhost:5173"],
     origin: '*', // This will allow all origins for development
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -48,29 +53,15 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(bodyParser.json());
-
-// Firebase Auth Middleware
-const verifyFirebaseToken = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader || !authHeader.startsWith('Bearer ') || !admin.auth) {
-        // Skip verification if no token or Firebase Admin not initialized
-        return next();
+// Use regular bodyParser for all routes except webhook
+app.use((req, res, next) => {
+    if (req.originalUrl === '/api/inspiringshereen-webhook') {
+        // Raw body needed for webhook signature verification
+        bodyParser.raw({ type: 'application/json' })(req, res, next);
+    } else {
+        bodyParser.json()(req, res, next);
     }
-
-    const token = authHeader.split('Bearer ')[1];
-
-    try {
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        req.user = decodedToken;
-        next();
-    } catch (error) {
-        console.error('Error verifying Firebase token:', error);
-        // Continue without user verification
-        next();
-    }
-};
+});
 
 // Email transporter
 const transporter = nodemailer.createTransport({
@@ -81,52 +72,9 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Store user registrations temporarily (in production use a database)
-const registrations = new Map();
-// Store confirmed payments
-const confirmedPayments = new Set();
-
 // Razorpay configuration
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
-
-// Function to save registration to Firestore
-async function saveRegistrationToFirestore(userId, registrationData) {
-    if (!db) return false;
-
-    try {
-        // If userId provided, save to user's document
-        if (userId) {
-            const userRef = db.collection('users').doc(userId);
-            const userDoc = await userRef.get();
-
-            if (userDoc.exists) {
-                const userData = userDoc.data();
-                const registrations = userData.registrations || [];
-
-                // Add new registration
-                registrations.push({
-                    ...registrationData,
-                    timestamp: new Date().toISOString()
-                });
-
-                // Update user document
-                await userRef.update({ registrations });
-            }
-        }
-
-        // Save to registrations collection regardless of user
-        await db.collection('registrations').doc(registrationData.referenceId).set({
-            ...registrationData,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        return true;
-    } catch (error) {
-        console.error('Firestore save error:', error);
-        return false;
-    }
-}
 
 // Function to send confirmation emails
 async function sendConfirmationEmails(userData, referenceId, transactionId) {
@@ -195,7 +143,7 @@ async function sendConfirmationEmails(userData, referenceId, transactionId) {
         await transporter.sendMail(adminMailOptions);
         return true;
     } catch (emailError) {
-        console.error('Email sending error:', emailError);
+        console.error('Error sending confirmation emails:', emailError);
         return false;
     }
 }
@@ -210,126 +158,138 @@ function verifyRazorpaySignature(orderId, paymentId, signature) {
     return generatedSignature === signature;
 }
 
-// API Routes - Apply Firebase verification where needed
-app.post('/api/register', verifyFirebaseToken, async (req, res) => {
+// Firebase Auth Middleware
+const authenticateFirebase = async (req, res, next) => {
     try {
-        const { fullName, email, phone } = req.body;
+        const authHeader = req.headers.authorization;
 
-        if (!fullName || !email || !phone) {
-            return res.status(400).json({ error: 'All fields are required' });
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Unauthorized: No valid authentication token provided' });
         }
 
-        const referenceId = crypto.randomBytes(6).toString('hex');
-        const timestamp = Date.now();
+        const token = authHeader.split('Bearer ')[1];
 
-        // Save in local memory
-        registrations.set(referenceId, {
-            fullName,
-            email,
-            phone,
-            timestamp,
-            paymentConfirmed: false,
-            userId: req.user?.uid || null
+        // Verify the Firebase ID token
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = decodedToken;
+
+        next();
+    } catch (error) {
+        console.error('Authentication error:', error);
+        return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    }
+};
+
+// Admin auth middleware
+const verifyAdmin = async (req, res, next) => {
+    if (!req.user) {
+        return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+    }
+
+    try {
+        // Get user custom claims to check admin status
+        const userRecord = await admin.auth().getUser(req.user.uid);
+        const customClaims = userRecord.customClaims || {};
+
+        if (!customClaims.admin) {
+            return res.status(403).json({ error: 'Forbidden: Admin access required' });
+        }
+
+        next();
+    } catch (error) {
+        console.error('Admin verification error:', error);
+        return res.status(500).json({ error: 'Error verifying admin status' });
+    }
+};
+
+// Update user registration
+app.post('/api/user/registrations', authenticateFirebase, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { referenceId, ...registrationData } = req.body;
+
+        if (!referenceId) {
+            return res.status(400).json({
+                success: false,
+                error: 'Reference ID is required'
+            });
+        }
+
+        // Update user registration in RTDB
+        await db.ref(`users/${uid}/registrations/${referenceId}`).set({
+            ...registrationData,
+            timestamp: registrationData.timestamp || new Date().toISOString()
         });
 
-        // Save in Firestore if available
-        if (db) {
-            try {
-                await saveRegistrationToFirestore(req.user?.uid, {
-                    referenceId,
-                    fullName,
-                    email,
-                    phone,
-                    timestamp,
-                    paymentConfirmed: false
-                });
-            } catch (firestoreError) {
-                console.error('Firestore save error:', firestoreError);
-                // Continue with local storage even if Firestore fails
-            }
-        }
+        // Store in global registrations as well
+        await registrationsRef.child(referenceId).set({
+            ...registrationData,
+            uid,
+            timestamp: registrationData.timestamp || new Date().toISOString()
+        });
 
         res.json({
             success: true,
-            referenceId: referenceId
+            message: 'Registration updated successfully'
         });
     } catch (error) {
-        console.error('Registration error:', error);
-        res.status(500).json({ error: 'Something went wrong' });
+        console.error('Error updating registration:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to update registration'
+        });
     }
 });
 
-app.post('/api/create-payment-order', verifyFirebaseToken, async (req, res) => {
+// In server.js - Update the /api/create-payment-order route handler
+app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => {
     try {
-        const { referenceId } = req.body;
+        // Check both request body and query parameters for referenceId
+        const referenceId = req.body.referenceId || req.query.referenceId;
 
         if (!referenceId) {
-            return res.status(400).json({ error: 'Reference ID is required' });
+            return res.status(400).json({
+                success: false,
+                error: 'Reference ID is required'
+            });
         }
 
-        if (!registrations.has(referenceId)) {
-            return res.status(404).json({ error: 'Invalid reference ID' });
-        }
+        // Rest of your existing code...
+        const amount = 100;
 
-        const userData = registrations.get(referenceId);
-
-        // Get Razorpay instance (using axios to create order)
-        const orderData = {
-            amount: 100, // amount in paisa (99 INR)
+        const options = {
+            amount,
             currency: "INR",
-            receipt: `receipt_${referenceId}`,
-            notes: {
-                referenceId: referenceId,
-                customerName: userData.fullName,
-                customerEmail: userData.email,
-                customerPhone: userData.phone,
-                userId: req.user?.uid || userData.userId || null
-            }
+            receipt: referenceId,
+            payment_capture: 1
         };
 
-        try {
-            // Create Razorpay order using Razorpay API
-            const response = await axios.post(
-                'https://api.razorpay.com/v1/orders',
-                orderData,
-                {
-                    auth: {
-                        username: RAZORPAY_KEY_ID,
-                        password: RAZORPAY_KEY_SECRET
-                    },
-                    headers: {
-                        'Content-Type': 'application/json'
-                    }
-                }
-            );
+        const order = await razorpay.orders.create(options);
 
-            const { id: orderId } = response.data;
+        // Store order ID in registration
+        await registrationsRef.child(referenceId).update({
+            orderId: order.id,
+            orderAmount: amount / 100,
+            orderCurrency: "INR",
+            orderStatus: "created",
+            orderTimestamp: new Date().toISOString()
+        });
 
-            // Store order ID in user data
-            userData.orderId = orderId;
-            registrations.set(referenceId, userData);
-
-            res.json({
-                success: true,
-                orderId: orderId,
-                razorpayKey: RAZORPAY_KEY_ID
-            });
-        } catch (apiError) {
-            console.error('Razorpay API error:', apiError.response?.data || apiError.message);
-            res.status(500).json({
-                error: 'Failed to create payment order',
-                details: apiError.response?.data?.error?.description || apiError.message
-            });
-        }
-    } catch (error) {
-        console.error('Payment order creation error:', error);
+        res.status(200).json({
+            success: true,
+            orderId: order.id,
+            razorpayKey: RAZORPAY_KEY_ID
+        });
+    } catch (err) {
+        console.error('Error creating payment order:', err);
         res.status(500).json({
-            error: 'Server error while creating payment order'
+            success: false,
+            error: err.message || "Payment order creation failed"
         });
     }
 });
 
-app.get('/api/check-payment', verifyFirebaseToken, (req, res) => {
+app.get('/api/check-payment', authenticateFirebase, async (req, res) => {
     try {
         const referenceId = req.query.reference_id;
 
@@ -340,37 +300,22 @@ app.get('/api/check-payment', verifyFirebaseToken, (req, res) => {
             });
         }
 
-        if (confirmedPayments.has(referenceId)) {
+        // Check if payment is confirmed in Firebase
+        const confirmedSnapshot = await confirmedPaymentsRef.child(referenceId).once('value');
+        const isConfirmed = confirmedSnapshot.exists();
+
+        if (isConfirmed) {
             res.json({ success: true });
-        } else if (registrations.has(referenceId)) {
-            res.json({
-                success: false,
-                status: 'PENDING',
-                message: 'Payment is being processed'
-            });
         } else {
-            // Try to check in Firestore if available
-            if (db) {
-                db.collection('registrations').doc(referenceId).get()
-                    .then(doc => {
-                        if (doc.exists && doc.data().paymentConfirmed) {
-                            res.json({ success: true });
-                        } else {
-                            res.json({
-                                success: false,
-                                status: 'UNKNOWN',
-                                message: 'Invalid reference ID or payment not confirmed'
-                            });
-                        }
-                    })
-                    .catch(err => {
-                        console.error('Firestore fetch error:', err);
-                        res.json({
-                            success: false,
-                            status: 'UNKNOWN',
-                            message: 'Invalid reference ID'
-                        });
-                    });
+            // Check if registration exists
+            const registrationSnapshot = await registrationsRef.child(referenceId).once('value');
+
+            if (registrationSnapshot.exists()) {
+                res.json({
+                    success: false,
+                    status: 'PENDING',
+                    message: 'Payment is being processed'
+                });
             } else {
                 res.json({
                     success: false,
@@ -380,7 +325,7 @@ app.get('/api/check-payment', verifyFirebaseToken, (req, res) => {
             }
         }
     } catch (error) {
-        console.error('Check payment error:', error);
+        console.error('Error checking payment:', error);
         res.status(500).json({
             success: false,
             error: 'Server error while checking payment'
@@ -388,7 +333,7 @@ app.get('/api/check-payment', verifyFirebaseToken, (req, res) => {
     }
 });
 
-app.post('/api/confirm-payment', verifyFirebaseToken, async (req, res) => {
+app.post('/api/confirm-payment', async (req, res) => {
     try {
         const {
             razorpay_payment_id,
@@ -399,6 +344,7 @@ app.post('/api/confirm-payment', verifyFirebaseToken, async (req, res) => {
 
         if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !referenceId) {
             return res.status(400).json({
+                success: false,
                 error: 'Payment details are incomplete'
             });
         }
@@ -412,72 +358,36 @@ app.post('/api/confirm-payment', verifyFirebaseToken, async (req, res) => {
 
         if (!isSignatureValid) {
             return res.status(400).json({
+                success: false,
                 error: 'Invalid payment signature'
             });
         }
 
-        let userData;
-        if (registrations.has(referenceId)) {
-            userData = registrations.get(referenceId);
-        } else if (db) {
-            // Try to fetch from Firestore
-            const doc = await db.collection('registrations').doc(referenceId).get();
-            if (doc.exists) {
-                userData = doc.data();
-            } else {
-                return res.status(404).json({
-                    error: 'Invalid reference ID'
-                });
-            }
-        } else {
+        // Get user data from Firebase
+        const userDataSnapshot = await registrationsRef.child(referenceId).once('value');
+        const userData = userDataSnapshot.val();
+
+        if (!userData) {
             return res.status(404).json({
+                success: false,
                 error: 'Invalid reference ID'
             });
         }
 
-        // Update payment information
-        userData.paymentConfirmed = true;
-        userData.transactionId = razorpay_payment_id;
+        // Update payment information in Firebase
+        await registrationsRef.child(referenceId).update({
+            paymentConfirmed: true,
+            transactionId: razorpay_payment_id,
+            paymentStatus: 'Confirmed',
+            paymentTimestamp: new Date().toISOString()
+        });
 
-        if (registrations.has(referenceId)) {
-            registrations.set(referenceId, userData);
-        }
-        confirmedPayments.add(referenceId);
-
-        // Update in Firestore if available
-        if (db) {
-            try {
-                await db.collection('registrations').doc(referenceId).update({
-                    paymentConfirmed: true,
-                    transactionId: razorpay_payment_id,
-                    paymentDate: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // Update in user's document if userId available
-                const userId = userData.userId || req.user?.uid;
-                if (userId) {
-                    const userRef = db.collection('users').doc(userId);
-                    const userDoc = await userRef.get();
-
-                    if (userDoc.exists) {
-                        const userData = userDoc.data();
-                        const registrations = userData.registrations || [];
-
-                        // Find and update the registration
-                        const registrationIndex = registrations.findIndex(r => r.referenceId === referenceId);
-                        if (registrationIndex !== -1) {
-                            registrations[registrationIndex].paymentConfirmed = true;
-                            registrations[registrationIndex].transactionId = razorpay_payment_id;
-
-                            await userRef.update({ registrations });
-                        }
-                    }
-                }
-            } catch (firestoreError) {
-                console.error('Firestore update error:', firestoreError);
-                // Continue even if Firestore update fails
-            }
-        }
+        // Add to confirmed payments
+        await confirmedPaymentsRef.child(referenceId).set({
+            paymentId: razorpay_payment_id,
+            orderId: razorpay_order_id,
+            timestamp: new Date().toISOString()
+        });
 
         // Send confirmation emails
         await sendConfirmationEmails(userData, referenceId, razorpay_payment_id);
@@ -487,17 +397,21 @@ app.post('/api/confirm-payment', verifyFirebaseToken, async (req, res) => {
             referenceId
         });
     } catch (error) {
-        console.error('Payment confirmation error:', error);
+        console.error('Error confirming payment:', error);
         res.status(500).json({
-            error: 'Something went wrong during payment confirmation'
+            success: false,
+            error: error.message || 'Something went wrong during payment confirmation'
         });
     }
 });
 
+// Webhook route with raw body parser for signature verification
 app.post('/api/inspiringshereen-webhook', async (req, res) => {
     try {
-        const webhookData = req.body;
-        console.log('Received Razorpay webhook:', JSON.stringify(webhookData));
+        // For raw body parser, we need to parse the buffer to JSON
+        const webhook_body = req.body.toString();
+        const webhookData = JSON.parse(webhook_body);
+        console.log('Webhook received:', webhookData.event);
 
         // Verify webhook signature
         const webhookSignature = req.headers['x-razorpay-signature'];
@@ -508,7 +422,7 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
             if (webhookSecret) {
                 const generatedSignature = crypto
                     .createHmac('sha256', webhookSecret)
-                    .update(JSON.stringify(req.body))
+                    .update(webhook_body)
                     .digest('hex');
 
                 if (generatedSignature !== webhookSignature) {
@@ -524,93 +438,73 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
             const orderId = paymentData.order_id;
             const paymentId = paymentData.id;
 
-            // Find the reference ID from the order ID
-            let referenceId = null;
-            let userData = null;
+            // Find registration by order ID in Firebase
+            const registrationsSnapshot = await registrationsRef.orderByChild('orderId').equalTo(orderId).once('value');
+            const registrations = registrationsSnapshot.val();
 
-            // Check local memory
-            for (const [key, value] of registrations.entries()) {
-                if (value.orderId === orderId) {
-                    referenceId = key;
-                    userData = value;
-                    break;
-                }
-            }
+            if (registrations) {
+                // There should be only one registration with this order ID
+                const referenceId = Object.keys(registrations)[0];
+                const userData = registrations[referenceId];
 
-            // If not found in memory, check Firestore
-            if (!referenceId && db) {
-                try {
-                    const registrationsSnapshot = await db.collection('registrations')
-                        .where('orderId', '==', orderId)
-                        .limit(1)
-                        .get();
+                if (referenceId && userData) {
+                    // Update in Firebase
+                    await registrationsRef.child(referenceId).update({
+                        paymentConfirmed: true,
+                        transactionId: paymentId,
+                        paymentStatus: 'Confirmed',
+                        paymentTimestamp: new Date().toISOString()
+                    });
 
-                    if (!registrationsSnapshot.empty) {
-                        const doc = registrationsSnapshot.docs[0];
-                        referenceId = doc.id;
-                        userData = doc.data();
-                    }
-                } catch (firestoreError) {
-                    console.error('Firestore query error:', firestoreError);
-                }
-            }
+                    // Add to confirmed payments
+                    await confirmedPaymentsRef.child(referenceId).set({
+                        paymentId,
+                        orderId,
+                        timestamp: new Date().toISOString()
+                    });
 
-            if (referenceId && userData) {
-                // Update in memory if available
-                if (registrations.has(referenceId)) {
-                    userData.paymentConfirmed = true;
-                    userData.transactionId = paymentId;
-                    registrations.set(referenceId, userData);
-                }
-                confirmedPayments.add(referenceId);
-
-                // Update in Firestore if available
-                if (db) {
-                    try {
-                        await db.collection('registrations').doc(referenceId).update({
+                    // If user ID is available, update user registration too
+                    if (userData.uid) {
+                        await db.ref(`users/${userData.uid}/registrations/${referenceId}`).update({
                             paymentConfirmed: true,
                             transactionId: paymentId,
-                            paymentDate: admin.firestore.FieldValue.serverTimestamp()
+                            paymentStatus: 'Confirmed',
+                            paymentTimestamp: new Date().toISOString()
                         });
+                    }
 
-                        // Update in user's document if userId available
-                        const userId = userData.userId;
-                        if (userId) {
-                            const userRef = db.collection('users').doc(userId);
-                            const userDoc = await userRef.get();
-
-                            if (userDoc.exists) {
-                                const userData = userDoc.data();
-                                const registrations = userData.registrations || [];
-
-                                // Find and update the registration
-                                const registrationIndex = registrations.findIndex(r => r.referenceId === referenceId);
-                                if (registrationIndex !== -1) {
-                                    registrations[registrationIndex].paymentConfirmed = true;
-                                    registrations[registrationIndex].transactionId = paymentId;
-
-                                    await userRef.update({ registrations });
-                                }
-                            }
-                        }
-                    } catch (firestoreError) {
-                        console.error('Firestore update error:', firestoreError);
+                    // Send confirmation emails ONLY for successful payments
+                    try {
+                        await sendConfirmationEmails(userData, referenceId, paymentId);
+                        console.log('Webhook: confirmation emails sent for payment', paymentId);
+                    } catch (emailError) {
+                        console.error('Webhook: failed to send confirmation emails:', emailError);
                     }
                 }
-
-                // Send confirmation emails ONLY for successful payments
-                try {
-                    await sendConfirmationEmails(userData, referenceId, paymentId);
-                    console.log(`Confirmation emails sent for reference ID: ${referenceId}`);
-                } catch (emailError) {
-                    console.error(`Failed to send confirmation emails for ${referenceId}:`, emailError);
-                }
             } else {
-                console.error(`Could not find referenceId for order ${orderId}`);
+                console.warn('Webhook: registration not found for order', orderId);
             }
         } else if (webhookData.event === 'payment.failed') {
-            console.log('Payment failed - no emails will be sent');
-            // Do not send any emails for failed payments
+            console.log('Payment failed webhook received');
+
+            // Update payment status in registration
+            const paymentData = webhookData.payload.payment.entity;
+            const orderId = paymentData.order_id;
+
+            // Find registration by order ID
+            const registrationsSnapshot = await registrationsRef.orderByChild('orderId').equalTo(orderId).once('value');
+            const registrations = registrationsSnapshot.val();
+
+            if (registrations) {
+                const referenceId = Object.keys(registrations)[0];
+
+                // Update status to failed
+                await registrationsRef.child(referenceId).update({
+                    paymentStatus: 'Failed',
+                    failureReason: paymentData.error_description || 'Payment failed',
+                    failureTimestamp: new Date().toISOString()
+                });
+            }
         }
 
         // Always return 200 for webhooks to acknowledge receipt
@@ -622,55 +516,291 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
     }
 });
 
-// Admin routes - secured with Firebase Auth
-app.get('/api/admin/registrations', verifyFirebaseToken, async (req, res) => {
-    // Check if user is authenticated and has admin role
-    if (!req.user) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
+// Admin routes - secured with Firebase Auth and Admin Check
+app.get('/api/admin/registrations', authenticateFirebase, verifyAdmin, async (req, res) => {
     try {
-        let registrationsData = [];
+        // Get all registrations from Firebase
+        const registrationsSnapshot = await registrationsRef.once('value');
+        const registrationsData = registrationsSnapshot.val() || {};
 
-        // If Firestore is available, get data from there
-        if (db) {
-            const snapshot = await db.collection('registrations').orderBy('createdAt', 'desc').get();
-            registrationsData = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data(),
-                createdAt: doc.data().createdAt?.toDate() || null
-            }));
-        } else {
-            // Otherwise use in-memory data
-            registrationsData = Array.from(registrations.entries()).map(([key, value]) => ({
-                id: key,
-                ...value
-            }));
-        }
+        // Convert to array format
+        const formattedRegistrations = Object.entries(registrationsData).map(([key, value]) => ({
+            id: key,
+            ...value
+        }));
 
         res.json({
             success: true,
-            registrations: registrationsData
+            registrations: formattedRegistrations
         });
     } catch (error) {
-        console.error('Admin registrations fetch error:', error);
+        console.error('Error fetching registrations:', error);
         res.status(500).json({ error: 'Something went wrong' });
     }
 });
 
-app.get('/api', (req, res) => {
-    res.json({ message: 'API is running' });
+// Add these routes to your server.js file
+
+// Update in server.js
+app.get('/api/admin/users', authenticateFirebase, verifyAdmin, async (req, res) => {
+    try {
+        // List all users from Firebase Auth
+        const listUsersResult = await admin.auth().listUsers();
+        const users = [];
+
+        // Get additional data from RTDB for each user
+        for (const userRecord of listUsersResult.users) {
+            try {
+                // Get user data from RTDB
+                const userRef = db.ref(`users/${userRecord.uid}`);
+                const snapshot = await userRef.once('value');
+                const userData = snapshot.val() || {};
+
+                if (!snapshot.exists()) {
+                    console.log(`Creating missing RTDB data for user ${userRecord.uid}, using Auth data only`);
+
+                    // If RTDB data doesn't exist, create it now from Auth data
+                    await userRef.set({
+                        fullName: userRecord.displayName || '',
+                        email: userRecord.email,
+                        createdAt: userRecord.metadata.creationTime
+                    });
+                }
+
+                // Merge Auth and RTDB data
+                users.push({
+                    id: userRecord.uid,
+                    email: userRecord.email,
+                    fullName: userRecord.displayName || userData.fullName || '',
+                    phone: userData.phone || '',
+                    disabled: userRecord.disabled || false,
+                    emailVerified: userRecord.emailVerified,
+                    createdAt: userData.createdAt || userRecord.metadata.creationTime,
+                    lastSignInTime: userRecord.metadata.lastSignInTime,
+                    registrations: userData.registrations || []
+                });
+            } catch (userError) {
+                console.error(`Error fetching data for user ${userRecord.uid}:`, userError);
+                // Still include basic user info even if RTDB data fetch fails
+                users.push({
+                    id: userRecord.uid,
+                    email: userRecord.email,
+                    fullName: userRecord.displayName || '',
+                    disabled: userRecord.disabled || false,
+                    emailVerified: userRecord.emailVerified,
+                    createdAt: userRecord.metadata.creationTime,
+                    lastSignInTime: userRecord.metadata.lastSignInTime,
+                });
+            }
+        }
+
+        res.json({
+            success: true,
+            users
+        });
+    } catch (error) {
+        console.error('Error fetching users:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to fetch users'
+        });
+    }
 });
 
-app.get('/status', (req, res) => {
-    res.json({ status: 'Server is running' });
+// Toggle user status (enable/disable)
+app.put('/api/admin/users/:userId/toggle-status', authenticateFirebase, verifyAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { disabled } = req.body;
+
+        if (typeof disabled !== 'boolean') {
+            return res.status(400).json({
+                success: false,
+                error: 'Disabled status must be a boolean'
+            });
+        }
+
+        // Update user in Firebase Auth
+        await admin.auth().updateUser(userId, { disabled });
+
+        res.json({
+            success: true,
+            message: `User ${disabled ? 'disabled' : 'enabled'} successfully`
+        });
+    } catch (error) {
+        console.error('Error toggling user status:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to update user status'
+        });
+    }
 });
 
-app.get('/', (req, res) => {
-    res.send('Server is running. API available at /api endpoints.');
+// Delete user account
+app.delete('/api/admin/users/:userId', authenticateFirebase, verifyAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        // Delete user from Firebase Auth
+        await admin.auth().deleteUser(userId);
+
+        // Delete user data from RTDB
+        await db.ref(`users/${userId}`).remove();
+
+        res.json({
+            success: true,
+            message: 'User deleted successfully'
+        });
+    } catch (error) {
+        console.error('Error deleting user:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to delete user'
+        });
+    }
 });
 
-// Start server
+// Route to create new user (admin only)
+app.post('/api/admin/users', authenticateFirebase, verifyAdmin, async (req, res) => {
+    try {
+        const { email, password, fullName, phone, isAdmin } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({
+                success: false,
+                error: 'Email and password are required'
+            });
+        }
+
+        // Create new user in Firebase Auth
+        const userRecord = await admin.auth().createUser({
+            email,
+            password,
+            displayName: fullName,
+            disabled: false
+        });
+
+        // Set admin claim if needed
+        if (isAdmin) {
+            await admin.auth().setCustomUserClaims(userRecord.uid, { admin: true });
+        }
+
+        // Save additional user data to RTDB
+        await db.ref(`users/${userRecord.uid}`).set({
+            fullName: fullName || '',
+            email,
+            phone: phone || '',
+            createdAt: new Date().toISOString()
+        });
+
+        res.json({
+            success: true,
+            message: 'User created successfully',
+            userId: userRecord.uid
+        });
+    } catch (error) {
+        console.error('Error creating user:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to create user'
+        });
+    }
+});
+
+// Route to set initial admin user
+app.post('/api/setup-admin', async (req, res) => {
+    // This endpoint should typically be secured or disabled in production
+    // It's used for initial setup only
+    try {
+        const { adminEmail, password, setupToken } = req.body;
+
+        // Basic security check to prevent unauthorized setup
+        // In a real app, use a more secure mechanism
+        if (!setupToken || setupToken !== 'initial-setup-token') {
+            return res.status(403).json({ error: 'Unauthorized setup attempt' });
+        }
+
+        // Look for the user by email
+        try {
+            const userRecord = await admin.auth().getUserByEmail(adminEmail);
+            // If user exists, set admin claim
+            await admin.auth().setCustomUserClaims(userRecord.uid, { admin: true });
+
+            return res.json({
+                success: true,
+                message: 'Admin privileges granted to existing user',
+                uid: userRecord.uid
+            });
+        } catch (userError) {
+            // User doesn't exist, create new admin user
+            if (userError.code === 'auth/user-not-found') {
+                const newUserRecord = await admin.auth().createUser({
+                    email: adminEmail,
+                    password: password,
+                    emailVerified: true
+                });
+
+                await admin.auth().setCustomUserClaims(newUserRecord.uid, { admin: true });
+
+                return res.json({
+                    success: true,
+                    message: 'New admin user created',
+                    uid: newUserRecord.uid
+                });
+            }
+
+            throw userError;
+        }
+    } catch (error) {
+        console.error('Error setting up admin:', error);
+        res.status(500).json({ error: error.message || 'Failed to setup admin user' });
+    }
+});
+
+// Enhanced error logging route
+app.post('/api/log-error', (req, res) => {
+    try {
+        const { message, stack, user, context } = req.body;
+
+        console.error('🚨 Client-side error:', {
+            timestamp: new Date().toISOString(),
+            message,
+            stack,
+            user: user ? `${user.email} (${user.id})` : 'Unknown',
+            context
+        });
+
+        res.status(200).json({ logged: true });
+    } catch (error) {
+        console.error('Error logging client error:', error);
+        res.status(500).json({ logged: false });
+    }
+});
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    const healthStatus = {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        services: {
+            email: !!process.env.EMAIL_USER && !!process.env.EMAIL_PASSWORD ? 'configured' : 'unconfigured',
+            razorpay: !!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET ? 'configured' : 'unconfigured',
+            firebase: admin.apps.length > 0 ? 'connected' : 'disconnected'
+        }
+    };
+
+    res.json(healthStatus);
+});
+
+// Start server with improved logging
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`
+    ✅ ====================================== ✅
+    🚀 Server running on port ${PORT}
+    📅 ${new Date().toISOString()}
+    📧 Email Service: ${process.env.EMAIL_USER ? 'Configured ✓' : 'Missing ✗'}
+    💰 Razorpay: ${RAZORPAY_KEY_ID ? 'Configured ✓' : 'Missing ✗'}
+    🔥 Firebase: ${admin.apps.length > 0 ? 'Connected ✓' : 'Missing ✗'}
+    ✅ ====================================== ✅
+    `);
 });
