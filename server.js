@@ -255,7 +255,7 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
         }
 
         // Rest of your existing code...
-        const amount = 100;
+        const amount = 9900;
 
         const options = {
             amount,
