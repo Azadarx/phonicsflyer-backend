@@ -9,10 +9,22 @@ const admin = require('firebase-admin');
 const Razorpay = require('razorpay'); // Make sure this is installed
 
 // Initialize Razorpay
-const razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+let razorpay;
+try {
+    razorpay = new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET
+    });
+
+    // Test the connection by making a simple API call
+    razorpay.payments.all({ count: 1 })
+        .then(() => console.log('✅ Razorpay connection successful'))
+        .catch(err => console.error('❌ Razorpay connection test failed:', err.message));
+} catch (error) {
+    console.error('❌ Failed to initialize Razorpay:', error.message);
+    // Don't exit process, allow server to start but payment will fail
+    razorpay = null;
+}
 
 // Initialize Firebase Admin SDK
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
@@ -238,6 +250,8 @@ app.post('/api/user/registrations', authenticateFirebase, async (req, res) => {
 });
 
 // Create payment order with Razorpay - no referenceId needed
+// In server.js, update the create-payment-order endpoint with better error handling
+
 app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -247,14 +261,27 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
         const userSnapshot = await registrationsRef.child(uid).once('value');
 
         if (!userSnapshot.exists()) {
-            console.error(`User registration data not found for user ${uid}`);
-            return res.status(404).json({
-                success: false,
-                error: 'Registration not found'
-            });
+            console.log(`User registration data not found for user ${uid}, creating empty registration`);
+
+            // Get basic user info from Firebase Auth
+            const userRecord = await admin.auth().getUser(uid);
+
+            // Create a basic registration entry if one doesn't exist
+            const basicRegistration = {
+                fullName: userRecord.displayName || 'Unknown',
+                email: userRecord.email || '',
+                phone: '',
+                timestamp: new Date().toISOString()
+            };
+
+            // Store basic registration
+            await registrationsRef.child(uid).set(basicRegistration);
+            await db.ref(`users/${uid}/registration`).set(basicRegistration);
+
+            console.log(`Created basic registration for user ${uid}`);
         }
 
-        const userData = userSnapshot.val();
+        // Proceed with payment order creation
         const amount = 9900; // ₹99 in paisa
 
         const options = {
@@ -297,10 +324,20 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
         } catch (razorpayError) {
             console.error('Razorpay API Error:', {
                 message: razorpayError.message,
-                error: razorpayError.error,
-                statusCode: razorpayError.statusCode,
+                error: razorpayError.error ? razorpayError.error : 'No error details',
+                statusCode: razorpayError.statusCode ? razorpayError.statusCode : 'No status code',
                 stack: razorpayError.stack
             });
+
+            // Check if the Razorpay instance is properly initialized
+            if (!razorpay.orders) {
+                console.error('Razorpay orders object not found - invalid configuration');
+                return res.status(500).json({
+                    success: false,
+                    error: "Payment system configuration error",
+                    details: "Could not initialize Razorpay properly"
+                });
+            }
 
             res.status(500).json({
                 success: false,
@@ -312,7 +349,8 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
         console.error('General error creating payment order:', err);
         res.status(500).json({
             success: false,
-            error: err.message || "Payment order creation failed"
+            error: err.message || "Payment order creation failed",
+            stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
         });
     }
 });
@@ -835,6 +873,30 @@ app.get('/api/health', (req, res) => {
     res.json(healthStatus);
 });
 
+function debugEnvironment() {
+    console.log('Environment check:');
+    console.log('- NODE_ENV:', process.env.NODE_ENV);
+    console.log('- RAZORPAY_KEY_ID:', process.env.RAZORPAY_KEY_ID ? 'Set ✓' : 'Missing ✗');
+    console.log('- RAZORPAY_KEY_SECRET:', process.env.RAZORPAY_KEY_SECRET ? 'Set ✓' : 'Missing ✗');
+    console.log('- Firebase service account:', process.env.FIREBASE_SERVICE_ACCOUNT ? 'Set ✓' : 'Missing ✗');
+
+    // Check if Firebase is properly initialized
+    if (admin.apps.length > 0) {
+        console.log('- Firebase initialized ✓');
+        console.log('- Database reference:', db ? 'Valid ✓' : 'Invalid ✗');
+        console.log('- Registrations reference:', registrationsRef ? 'Valid ✓' : 'Invalid ✗');
+    } else {
+        console.log('- Firebase NOT initialized ✗');
+    }
+
+    // Check Razorpay
+    if (razorpay) {
+        console.log('- Razorpay initialized ✓');
+    } else {
+        console.log('- Razorpay NOT initialized ✗');
+    }
+}
+
 // Start server with improved logging
 app.listen(PORT, () => {
     console.log(`
@@ -846,4 +908,5 @@ app.listen(PORT, () => {
     🔥 Firebase: ${admin.apps.length > 0 ? 'Connected ✓' : 'Missing ✗'}
     ✅ ====================================== ✅
     `);
+    debugEnvironment();
 });
