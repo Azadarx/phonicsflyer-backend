@@ -304,11 +304,17 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
                 razorpayKey: RAZORPAY_KEY_ID
             });
         } catch (razorpayError) {
-            console.error('Razorpay API error:', razorpayError);
+            console.error('🔴 Razorpay API Error:', {
+                message: razorpayError.message,
+                error: razorpayError.error,
+                statusCode: razorpayError.statusCode,
+                stack: razorpayError.stack
+            });
+
             res.status(500).json({
                 success: false,
-                error: `Razorpay error: ${razorpayError.message}`,
-                code: razorpayError.code || 'unknown'
+                error: razorpayError?.error?.description || razorpayError.message || "Unknown Razorpay error",
+                code: razorpayError?.error?.code || 'unknown'
             });
         }
     } catch (err) {
