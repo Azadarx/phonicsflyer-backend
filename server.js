@@ -244,18 +244,36 @@ app.post('/api/user/registrations', authenticateFirebase, async (req, res) => {
 // In server.js - Update the /api/create-payment-order route handler
 app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => {
     try {
+        // Add detailed logging
+        console.log('Creating payment order. Request body:', req.body);
+        console.log('Authenticated user:', req.user ? req.user.uid : 'No user');
+
         // Check both request body and query parameters for referenceId
         const referenceId = req.body.referenceId || req.query.referenceId;
 
         if (!referenceId) {
+            console.error('Missing referenceId in request');
             return res.status(400).json({
                 success: false,
                 error: 'Reference ID is required'
             });
         }
 
+        console.log(`Using referenceId: ${referenceId}`);
+
+        // Verify the registration exists in Firebase
+        const regSnapshot = await registrationsRef.child(referenceId).once('value');
+        if (!regSnapshot.exists()) {
+            console.error(`Registration with ID ${referenceId} not found in Firebase`);
+            return res.status(404).json({
+                success: false,
+                error: 'Registration not found'
+            });
+        }
+
         // Rest of your existing code...
         const amount = 9900;
+        console.log(`Creating Razorpay order with amount: ${amount}`);
 
         const options = {
             amount,
@@ -264,24 +282,37 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
             payment_capture: 1
         };
 
-        const order = await razorpay.orders.create(options);
+        console.log('Razorpay options:', options);
 
-        // Store order ID in registration
-        await registrationsRef.child(referenceId).update({
-            orderId: order.id,
-            orderAmount: amount / 100,
-            orderCurrency: "INR",
-            orderStatus: "created",
-            orderTimestamp: new Date().toISOString()
-        });
+        // Include proper error handling when calling Razorpay
+        try {
+            const order = await razorpay.orders.create(options);
+            console.log('Razorpay order created successfully:', order.id);
 
-        res.status(200).json({
-            success: true,
-            orderId: order.id,
-            razorpayKey: RAZORPAY_KEY_ID
-        });
+            // Store order ID in registration
+            await registrationsRef.child(referenceId).update({
+                orderId: order.id,
+                orderAmount: amount / 100,
+                orderCurrency: "INR",
+                orderStatus: "created",
+                orderTimestamp: new Date().toISOString()
+            });
+
+            res.status(200).json({
+                success: true,
+                orderId: order.id,
+                razorpayKey: RAZORPAY_KEY_ID
+            });
+        } catch (razorpayError) {
+            console.error('Razorpay API error:', razorpayError);
+            res.status(500).json({
+                success: false,
+                error: `Razorpay error: ${razorpayError.message}`,
+                code: razorpayError.code || 'unknown'
+            });
+        }
     } catch (err) {
-        console.error('Error creating payment order:', err);
+        console.error('General error creating payment order:', err);
         res.status(500).json({
             success: false,
             error: err.message || "Payment order creation failed"
