@@ -285,7 +285,7 @@ app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => 
         const amount = 9900; // ₹99 in paisa
 
         const options = {
-            amount: 100,
+            amount: 9900,
             currency: "INR",
             receipt: `rcpt_${Date.now()}`, // ✅ Short & unique
             payment_capture: 1,
