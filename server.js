@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const admin = require('firebase-admin');
 const Razorpay = require('razorpay'); // Make sure this is installed
+const contactRoutes = require('./routes/contactRoutes');
 
 // Initialize Razorpay
 let razorpay;
@@ -215,30 +216,26 @@ const verifyAdmin = async (req, res, next) => {
     }
 };
 
-// Update these functions in your server.js file
-
-// Update user registration - no referenceId needed
-app.post('/api/user/registrations', authenticateFirebase, async (req, res) => {
+// Replace this endpoint in server.js
+app.post('/api/user/registrations', async (req, res) => {
     try {
-        const uid = req.user.uid;
+        // Instead of relying on req.user.uid from authentication middleware
         const registrationData = req.body;
 
-        // Store user registration data
-        await db.ref(`users/${uid}/registration`).set({
-            ...registrationData,
-            timestamp: registrationData.timestamp || new Date().toISOString()
-        });
+        // Generate a unique ID for this registration if no authentication
+        const registrationId = Date.now().toString();
 
-        // Also store in global registrations collection with UID as key
-        await registrationsRef.child(uid).set({
+        // Store in global registrations collection
+        await registrationsRef.child(registrationId).set({
             ...registrationData,
-            uid,
+            registrationId,
             timestamp: registrationData.timestamp || new Date().toISOString()
         });
 
         res.json({
             success: true,
-            message: 'Registration updated successfully'
+            message: 'Registration updated successfully',
+            registrationId
         });
     } catch (error) {
         console.error('Error updating registration:', error);
@@ -249,114 +246,83 @@ app.post('/api/user/registrations', authenticateFirebase, async (req, res) => {
     }
 });
 
-// Create payment order with Razorpay - no referenceId needed
-// In server.js, update the create-payment-order endpoint with better error handling
-
-app.post('/api/create-payment-order', authenticateFirebase, async (req, res) => {
+app.post('/api/create-payment-order', async (req, res) => {
     try {
-        const uid = req.user.uid;
-        console.log('Creating payment order for user:', uid);
+        // Validate required fields
+        const { email, amount = 9900, discountApplied = false } = req.body;
 
-        // Fetch user data to verify registration
-        const userSnapshot = await registrationsRef.child(uid).once('value');
-
-        if (!userSnapshot.exists()) {
-            console.log(`User registration data not found for user ${uid}, creating empty registration`);
-
-            // Get basic user info from Firebase Auth
-            const userRecord = await admin.auth().getUser(uid);
-
-            // Create a basic registration entry if one doesn't exist
-            const basicRegistration = {
-                fullName: userRecord.displayName || 'Unknown',
-                email: userRecord.email || '',
-                phone: '',
-                timestamp: new Date().toISOString()
-            };
-
-            // Store basic registration
-            await registrationsRef.child(uid).set(basicRegistration);
-            await db.ref(`users/${uid}/registration`).set(basicRegistration);
-
-            console.log(`Created basic registration for user ${uid}`);
+        if (!email) {
+            return res.status(400).json({
+                success: false,
+                error: "Email is required"
+            });
         }
 
-        // Proceed with payment order creation
-        const amount = 9900; // ₹99 in paisa
+        // Check if Razorpay is properly initialized
+        if (!razorpay || !razorpay.orders) {
+            console.error('Razorpay not properly initialized');
+            return res.status(500).json({
+                success: false,
+                error: "Payment system is currently unavailable"
+            });
+        }
+
+        const actualAmount = discountApplied ? 7900 : 9900; // ₹99 or ₹79 in paisa
+        // const actualAmount = 100; // ₹99 or ₹79 in paisa
 
         const options = {
-            amount: 9900,
+            amount: actualAmount,
             currency: "INR",
-            receipt: `rcpt_${Date.now()}`, // ✅ Short & unique
+            receipt: `rcpt_${Date.now()}`,
             payment_capture: 1,
+            notes: {
+                email: email,
+                discountApplied: discountApplied
+            }
         };
 
-        console.log('Razorpay options:', options);
-
         // Create Razorpay order
-        try {
-            const order = await razorpay.orders.create(options);
-            console.log('Razorpay order created successfully:', order.id);
+        const order = await razorpay.orders.create(options);
 
-            // Store order ID in user's registration
-            await registrationsRef.child(uid).update({
-                orderId: order.id,
-                orderAmount: amount / 100,
-                orderCurrency: "INR",
-                orderStatus: "created",
-                orderTimestamp: new Date().toISOString()
-            });
+        // Store order info in a separate orders collection
+        await db.ref(`orders/${order.id}`).set({
+            email,
+            orderAmount: actualAmount / 100,
+            orderCurrency: "INR",
+            orderStatus: "created",
+            orderTimestamp: new Date().toISOString(),
+            discountApplied
+        });
 
-            // Also update in user-specific path
-            await db.ref(`users/${uid}/registration`).update({
-                orderId: order.id,
-                orderAmount: amount / 100,
-                orderCurrency: "INR",
-                orderStatus: "created",
-                orderTimestamp: new Date().toISOString()
-            });
-
-            res.status(200).json({
-                success: true,
-                orderId: order.id,
-                razorpayKey: RAZORPAY_KEY_ID
-            });
-        } catch (razorpayError) {
-            console.error('Razorpay API Error:', {
-                message: razorpayError.message,
-                error: razorpayError.error ? razorpayError.error : 'No error details',
-                statusCode: razorpayError.statusCode ? razorpayError.statusCode : 'No status code',
-                stack: razorpayError.stack
-            });
-
-            // Check if the Razorpay instance is properly initialized
-            if (!razorpay.orders) {
-                console.error('Razorpay orders object not found - invalid configuration');
-                return res.status(500).json({
-                    success: false,
-                    error: "Payment system configuration error",
-                    details: "Could not initialize Razorpay properly"
-                });
-            }
-
-            res.status(500).json({
-                success: false,
-                error: razorpayError?.error?.description || razorpayError.message || "Unknown Razorpay error",
-                code: razorpayError?.error?.code || 'unknown'
-            });
-        }
+        res.status(200).json({
+            success: true,
+            orderId: order.id,
+            razorpayKey: RAZORPAY_KEY_ID,
+            amount: actualAmount,
+            currency: "INR"
+        });
     } catch (err) {
-        console.error('General error creating payment order:', err);
+        console.error('Error creating payment order:', err);
+
+        let errorMessage = "Payment order creation failed";
+        let errorDetails = {};
+
+        if (err.error && err.error.description) {
+            errorMessage = err.error.description;
+            errorDetails = err.error;
+        } else if (err.message) {
+            errorMessage = err.message;
+        }
+
         res.status(500).json({
             success: false,
-            error: err.message || "Payment order creation failed",
-            stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+            error: errorMessage,
+            details: process.env.NODE_ENV === 'development' ? errorDetails : undefined
         });
     }
 });
-
 // Confirm payment
-app.post('/api/confirm-payment', authenticateFirebase, async (req, res) => {
+app.post('/api/confirm-payment', async (req, res) => {
     try {
         const {
             razorpay_payment_id,
@@ -555,7 +521,7 @@ app.post('/api/inspiringshereen-webhook', async (req, res) => {
 });
 
 // Payment check endpoint - fixed to be outside webhook handler
-app.get('/api/check-payment', authenticateFirebase, async (req, res) => {
+app.get('/api/check-payment', async (req, res) => {
     try {
         const uid = req.user.uid;
 
@@ -797,7 +763,7 @@ app.post('/api/setup-admin', async (req, res) => {
 
         // Basic security check to prevent unauthorized setup
         // In a real app, use a more secure mechanism
-        if (!setupToken || setupToken !== 'initial-setup-token') {
+        if (!setupToken || setupToken !== process.env.SETUP_TOKEN) {
             return res.status(403).json({ error: 'Unauthorized setup attempt' });
         }
 
@@ -806,6 +772,12 @@ app.post('/api/setup-admin', async (req, res) => {
             const userRecord = await admin.auth().getUserByEmail(adminEmail);
             // If user exists, set admin claim
             await admin.auth().setCustomUserClaims(userRecord.uid, { admin: true });
+
+            // Ensure database entry exists
+            await db.ref(`users/${userRecord.uid}`).update({
+                isAdmin: true,
+                updatedAt: new Date().toISOString()
+            });
 
             return res.json({
                 success: true,
@@ -823,6 +795,14 @@ app.post('/api/setup-admin', async (req, res) => {
 
                 await admin.auth().setCustomUserClaims(newUserRecord.uid, { admin: true });
 
+                // Create a database entry for this admin
+                await db.ref(`users/${newUserRecord.uid}`).set({
+                    fullName: 'Admin',
+                    email: adminEmail,
+                    isAdmin: true,
+                    createdAt: new Date().toISOString()
+                });
+
                 return res.json({
                     success: true,
                     message: 'New admin user created',
@@ -837,6 +817,9 @@ app.post('/api/setup-admin', async (req, res) => {
         res.status(500).json({ error: error.message || 'Failed to setup admin user' });
     }
 });
+
+app.use('/api', contactRoutes);
+console.log(`📧 Email Service: ${process.env.EMAIL_USER ? 'Configured ✓' : 'Missing ✗'}`);
 
 // Enhanced error logging route
 app.post('/api/log-error', (req, res) => {
