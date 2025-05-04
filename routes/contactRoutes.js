@@ -92,7 +92,7 @@ router.post('/contact', async (req, res) => {
           <p>If you have any urgent questions, please feel free to reach out directly to <a href="mailto:inspiringshereen@gmail.com">inspiringshereen@gmail.com</a>.</p>
           
           <p style="margin-top: 20px;">Warm regards,</p>
-          <p><strong>Shereen Begum</strong><br>
+          <p><strong>Mrs. Shereen</strong><br>
           Phonics Teaching Specialist</p>
         </div>
       `
